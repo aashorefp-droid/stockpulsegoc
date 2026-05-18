@@ -1,0 +1,56 @@
+# ── Secrets / environment ──────────────────────────────────────────────────
+.env
+.env.*
+*.env
+!.env.example
+!backend/.env.example
+frontend/.env.local
+frontend/.env
+
+# Legacy centralized configs with HARDCODED secrets (the env-only
+# backend/config.py is the one that IS tracked — do not ignore that).
+/config.py
+/go-backend/config.py
+
+# Local launcher scripts (contain DATABASE_URL / tokens)
+*.bat
+
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ── Local data / runtime caches (not source) ───────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+backend/db/gex_history.json
+backend/services/.gmail_cache/
+backend/services/.watchlist_cache/
+*.log
+
+# ── Node / Next.js ─────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+build/
+dist/
+npm-debug.log*
+yarn-error.log*
+
+# ── Go build artifacts ─────────────────────────────────────────────────────
+go-backend/*.exe
+go-backend/bin/
+
+# ── OS / editor ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+
+# go-backend is its own separate git repo — excluded here.
+/go-backend/
