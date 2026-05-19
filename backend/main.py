@@ -56,6 +56,13 @@ def health():
         "status":          "ok",
         "scheduler":       sched.running,
         "polling_active":  sched.get_job("eps_poll") is not None,
-        "spy_gamma_job":   sched.get_job("spy_gamma") is not None,
+        "spy_gamma_job":   (
+            sched.get_job("spy_gamma_open") is not None
+            or sched.get_job("spy_gamma_close") is not None
+        ),
+        "sector_gamma_job": (
+            sched.get_job("sector_gamma_open") is not None
+            or sched.get_job("sector_gamma_close") is not None
+        ),
         "gex_store":       gex_store.backend_name(),
     }

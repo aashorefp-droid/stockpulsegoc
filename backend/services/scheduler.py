@@ -534,8 +534,8 @@ def telegram_watchlist_job():
 
 
 def sector_gamma_job():
-    """Every 4h on trading days — recompute all sector GEX so the per-sector
-    daily streak is recorded even when no one has the UI open."""
+    """After open/close on trading days: recompute all sector GEX so the
+    per-sector daily streak is recorded even when no one has the UI open."""
     try:
         from backend.services.gex import compute_sector_gex
         res = compute_sector_gex()
@@ -552,7 +552,7 @@ def sector_gamma_job():
 
 
 def spy_gamma_job():
-    """Every 4h on trading days — recompute SPY GEX so the daily sign is
+    """After open/close on trading days: recompute SPY GEX so the daily sign is
     recorded (and the consecutive-day streak advances) even when nobody has
     the UI open. Without this, SPY's streak pins at ±1 because its sign is
     only written opportunistically on UI hits (sectors already have a job)."""
@@ -640,23 +640,35 @@ def setup_scheduler():
         misfire_grace_time=3600,
     )
 
-    # Sector GEX every 4h on trading days (Mon–Fri) so each sector's daily
-    # streak is recorded regardless of UI usage. Fires 00:05/04:05/08:05/
-    # 12:05/16:05/20:05 CST — at least one per 4h every trading day.
+    # Gamma refreshes twice on trading days: after open and after close.
+    # SPY runs a few minutes before sectors so provider calls are staggered.
     scheduler.add_job(
         sector_gamma_job,
-        CronTrigger(day_of_week="mon-fri", hour="*/4", minute=5, timezone=CST),
-        id="sector_gamma",
+        CronTrigger(day_of_week="mon-fri", hour=8, minute=40, timezone=CST),
+        id="sector_gamma_open",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        sector_gamma_job,
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=10, timezone=CST),
+        id="sector_gamma_close",
         replace_existing=True,
         misfire_grace_time=3600,
     )
 
-    # SPY GEX on the same cadence so its daily sign is recorded regardless of
-    # UI usage. minute=2 (before sectors at :05) keeps the SPY write first.
+    # These writes persist to Neon when DATABASE_URL is configured.
     scheduler.add_job(
         spy_gamma_job,
-        CronTrigger(day_of_week="mon-fri", hour="*/4", minute=2, timezone=CST),
-        id="spy_gamma",
+        CronTrigger(day_of_week="mon-fri", hour=8, minute=37, timezone=CST),
+        id="spy_gamma_open",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        spy_gamma_job,
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=7, timezone=CST),
+        id="spy_gamma_close",
         replace_existing=True,
         misfire_grace_time=3600,
     )
@@ -671,5 +683,5 @@ def setup_scheduler():
     logger.info(
         "[scheduler] registered: news_summary@8:00CST, pre_earnings@8:30CST, "
         "momentum@8:45CST, polling 15:00–18:00 CST, tos_gmail_watchlist@19:15CST, "
-        "spy_gamma + sector_gamma every 4h Mon–Fri"
+        "spy_gamma + sector_gamma after open and after close Mon–Fri"
     )

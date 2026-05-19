@@ -252,11 +252,21 @@ def _fetch_chain_yfinance(symbol: str, spot: float) -> list[dict]:
         import yfinance as yf
     except Exception:
         return []
+
+    def _new_ticker():
+        return yf.Ticker(symbol)
+
+    tk = _new_ticker()
     try:
-        tk = yf.Ticker(symbol)
-        expirations = tk.options
-    except Exception:
-        return []
+        expirations = list(tk.options or [])
+    except Exception as e:
+        logger.warning("[gex] yfinance expirations failed for %s: %s", symbol, str(e)[:120])
+        time.sleep(1)
+        tk = _new_ticker()
+        try:
+            expirations = list(tk.options or [])
+        except Exception:
+            expirations = []
     if not expirations:
         return []
 
@@ -273,9 +283,21 @@ def _fetch_chain_yfinance(symbol: str, spot: float) -> list[dict]:
 
     contracts: list[dict] = []
     for exp in target_exps:
-        try:
-            chain = tk.option_chain(exp)
-        except Exception:
+        chain = None
+        for attempt in range(2):
+            try:
+                chain = tk.option_chain(exp)
+                break
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(1)
+                    tk = _new_ticker()
+                    continue
+                logger.warning(
+                    "[gex] yfinance option chain failed for %s %s: %s",
+                    symbol, exp, str(e)[:120],
+                )
+        if chain is None:
             continue
         for df, is_call in [(chain.calls, True), (chain.puts, False)]:
             for _, row in df.iterrows():
@@ -328,6 +350,11 @@ def compute_gex(symbol: str, use_cboe: bool = False) -> dict:
             source = "yfinance"
             contracts = _fetch_chain_yfinance(symbol, spot)
     if not contracts or not spot:
+        if c and c.get("data"):
+            stale = dict(c["data"])
+            stale["stale"] = True
+            stale["reason"] = "using last good GEX; fresh options chain unavailable"
+            return stale
         return {"available": False,
                 "reason": "options chain empty (cboe + alpaca + yfinance)"}
 
@@ -442,6 +469,8 @@ def compute_sector_gex() -> dict:
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    # Keep Yahoo/yfinance option-chain calls modest; bursty parallel requests
+    # intermittently return Invalid Crumb 401s on Render.
+    with ThreadPoolExecutor(max_workers=2) as ex:
         sectors = list(ex.map(_sector_one, SECTOR_GEX_SYMBOLS))
     return {"sectors": sectors}
