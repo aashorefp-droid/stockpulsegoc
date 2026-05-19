@@ -117,7 +117,8 @@ async def get_stock_analysis(ticker: str):
     except Exception:
         fib_zone = "MID"
 
-    options_bias     = _safe(get_options_bias, {"error": "Unavailable"}, ticker)
+    options_bias     = _safe(get_options_bias, {"error": "Unavailable"}, ticker,
+                             current_price, ALPACA_API_KEY, ALPACA_API_SECRET)
     is_exceptional   = entry_grade.get("entry_grade") in ("S", "A", "B", "B-")
     options_strategy = None
     if is_exceptional:

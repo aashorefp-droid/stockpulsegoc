@@ -1,8 +1,7 @@
 """
-Options bias (yfinance, free) + strategy recommendation.
+Options bias helper + Alpaca strategy recommendation.
 Strategy mirrors get_options_strategy_alpaca() from stock_pulse.py exactly:
-  - Alpaca /v1beta1/options/snapshots first
-  - yfinance chain fallback if Alpaca options not enabled
+  - Alpaca /v1beta1/options/snapshots only
   - Bull Call Spread (LONG) · Bear Put Spread (SHORT) · Iron Butterfly (NEUTRAL)
   - zone parameter (HIGH/MID/LOW) derived from Fib position drives neutral detection
 """
@@ -52,7 +51,7 @@ def _alpaca_get(endpoint: str, params: dict, api_key: str, api_secret: str) -> d
 
 # ── Options bias (yfinance, delta-aware) ─────────────────────────────────────
 
-def get_options_bias(ticker: str) -> dict:
+def _get_options_bias_yfinance(ticker: str) -> dict:
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
@@ -234,27 +233,166 @@ def get_options_bias(ticker: str) -> dict:
 
 # ── Options strategy — mirrors get_options_strategy_alpaca() exactly ──────────
 
+def get_options_bias(ticker: str, current_price: float = 0.0,
+                     api_key: str = "", api_secret: str = "") -> dict:
+    """Alpaca-only options positioning snapshot for the analysis page."""
+    try:
+        price = _safe_float(current_price)
+        contracts = _fetch_contracts_alpaca(ticker, api_key, api_secret, price)
+        if not contracts:
+            return {"error": "No Alpaca options data"}
+
+        def _mid(c: dict) -> float:
+            b, a, l = c.get("bid", 0), c.get("ask", 0), c.get("last", 0)
+            return (b + a) / 2 if b > 0 and a > 0 else _safe_float(l)
+
+        def _otm_pct(c: dict) -> float:
+            if price <= 0:
+                return 0.0
+            if c.get("is_call"):
+                return max(0.0, (c["strike"] - price) / price * 100)
+            return max(0.0, (price - c["strike"]) / price * 100)
+
+        calls = [c for c in contracts if c.get("is_call")]
+        puts = [c for c in contracts if not c.get("is_call")]
+        call_oi = sum(int(c.get("oi") or 0) for c in calls)
+        put_oi = sum(int(c.get("oi") or 0) for c in puts)
+        call_vol = sum(int(c.get("volume") or 0) for c in calls)
+        put_vol = sum(int(c.get("volume") or 0) for c in puts)
+
+        oi_pc = put_oi / call_oi if call_oi > 0 else 0
+        vol_pc = put_vol / call_vol if call_vol > 0 else 0
+        if call_oi == 0 and put_oi == 0:
+            oi_sentiment = "N/A"
+        elif oi_pc < 0.7:
+            oi_sentiment = "BULLISH"
+        elif oi_pc <= 1.0:
+            oi_sentiment = "NEUTRAL"
+        else:
+            oi_sentiment = "BEARISH"
+
+        spec_bull_oi = spec_bear_oi = atm_call_oi = atm_put_oi = 0
+        if price > 0:
+            for c in calls:
+                m = (c["strike"] - price) / price
+                if m > 0.05:
+                    spec_bull_oi += int(c.get("oi") or 0)
+                elif -0.05 <= m <= 0.05:
+                    atm_call_oi += int(c.get("oi") or 0)
+            for p in puts:
+                m = (price - p["strike"]) / price
+                if -0.05 <= m <= 0.10:
+                    spec_bear_oi += int(p.get("oi") or 0)
+                elif m < -0.05:
+                    atm_put_oi += int(p.get("oi") or 0)
+
+        dir_bull = spec_bull_oi + atm_call_oi
+        dir_bear = spec_bear_oi + atm_put_oi
+        total_dir = dir_bull + dir_bear
+        delta_bull_pct = dir_bull / total_dir if total_dir > 0 else 0.5
+        delta_bear_pct = dir_bear / total_dir if total_dir > 0 else 0.5
+        if delta_bull_pct > 0.60:
+            delta_sentiment = "BULLISH"
+        elif delta_bear_pct > 0.60:
+            delta_sentiment = "BEARISH"
+        else:
+            delta_sentiment = "NEUTRAL"
+
+        unusual = []
+        for c in contracts:
+            typ = "CALL" if c.get("is_call") else "PUT"
+            vol = int(c.get("volume") or 0)
+            oi = int(c.get("oi") or 0)
+            mid = _mid(c)
+            notional = round(vol * mid * 100, 0) if mid > 0 else 0
+            flow_tags = []
+            if oi == 0 and vol >= 10:
+                flow_tags.append("OPENING")
+            if oi > 0 and vol > oi:
+                flow_tags.append("SWEEP")
+            if vol >= 1000:
+                flow_tags.append("BLOCK")
+            if _otm_pct(c) >= 30 and vol >= 50:
+                flow_tags.append("FAR_OTM")
+            if notional >= 10_000:
+                flow_tags.append("LARGE_NOTIONAL")
+            if oi > 0 and vol / oi > 2 and vol >= 100:
+                flow_tags.append("HIGH_RATIO")
+            if not any(t in {"OPENING", "SWEEP", "FAR_OTM", "HIGH_RATIO"} for t in flow_tags):
+                continue
+            unusual.append({
+                "volume": vol,
+                "oi": oi,
+                "strike": c["strike"],
+                "iv": round(_norm_iv(c.get("iv")) * 100, 1),
+                "itm": _otm_pct(c) == 0,
+                "expiry": c["exp"],
+                "type": typ,
+                "otm_pct": round(_otm_pct(c), 1),
+                "notional": int(notional),
+                "flow_type": "/".join(flow_tags),
+            })
+        unusual.sort(key=lambda x: (
+            -("FAR_OTM" in x["flow_type"] or "LARGE_NOTIONAL" in x["flow_type"]),
+            -x["volume"],
+        ))
+        unusual_keys = {(u["strike"], u["type"], u["expiry"]) for u in unusual}
+
+        otm_liquid = []
+        for c in contracts:
+            typ = "CALL" if c.get("is_call") else "PUT"
+            vol = int(c.get("volume") or 0)
+            oi = int(c.get("oi") or 0)
+            otm = _otm_pct(c)
+            if otm <= 0 or vol < 50 or oi < 100:
+                continue
+            otm_liquid.append({
+                "strike": c["strike"],
+                "type": typ,
+                "expiry": c["exp"],
+                "volume": vol,
+                "oi": oi,
+                "iv": round(_norm_iv(c.get("iv")) * 100, 1),
+                "otm_pct": round(otm, 1),
+                "vol_oi_ratio": round(vol / oi, 2) if oi > 0 else 0,
+                "unusual": (c["strike"], typ, c["exp"]) in unusual_keys,
+            })
+        otm_liquid.sort(key=lambda x: (-x["unusual"], -x["volume"]))
+
+        return {
+            "call_oi": call_oi, "put_oi": put_oi,
+            "call_vol": call_vol, "put_vol": put_vol,
+            "oi_pc_ratio": round(oi_pc, 2), "vol_pc_ratio": round(vol_pc, 2),
+            "oi_sentiment": oi_sentiment, "delta_sentiment": delta_sentiment,
+            "delta_bull_pct": round(delta_bull_pct * 100, 1),
+            "delta_bear_pct": round(delta_bear_pct * 100, 1),
+            "unusual_count": len(unusual),
+            "unusual_activity": unusual[:5],
+            "otm_liquid": otm_liquid[:10],
+            "expirations_scanned": len(set(c["exp"] for c in contracts)),
+            "source": "alpaca",
+        }
+    except Exception as e:
+        return {"error": str(e)[:100]}
+
+
 def get_options_strategy(ticker: str, current_price: float, direction: str,
                          api_key: str = "", api_secret: str = "",
                          zone: str = "MID") -> Optional[dict]:
     """
     Exact port of stock_pulse.get_options_strategy_alpaca().
-    Tries Alpaca first; falls back to yfinance chain on failure.
+    Uses Alpaca options snapshots only.
     zone: 'HIGH' | 'MID' | 'LOW'  (derived from Fib position by caller)
       HIGH → price above 61.8% retracement → neutral/iron-butterfly zone
       LOW  → price below 38.2% → directional
       MID  → between → directional
     """
     contracts = _fetch_contracts_alpaca(ticker, api_key, api_secret, current_price)
-    source = "alpaca"
-    if not contracts:
-        contracts = _fetch_contracts_yfinance(ticker)
-        source = "yfinance"
     if not contracts:
         return None
     result = _build_strategy(ticker, current_price, direction, zone, contracts)
     if result:
-        result["source"] = source
+        result["source"] = "alpaca"
     return result
 
 
@@ -322,6 +460,7 @@ def _fetch_contracts_alpaca(ticker: str, api_key: str, api_secret: str,
 
             quote = snap.get("latestQuote", {})
             trade = snap.get("latestTrade", {})
+            bar = snap.get("dailyBar", {}) or snap.get("daily_bar", {})
             iv = _norm_iv(snap.get("impliedVolatility")
                           or snap.get("implied_volatility")
                           or snap.get("iv"))
@@ -334,6 +473,7 @@ def _fetch_contracts_alpaca(ticker: str, api_key: str, api_secret: str,
                 "last":     float(trade.get("p", 0) or 0),
                 "iv":       iv,
                 "oi":       int(snap.get("openInterest", 0) or 0),
+                "volume":   int(_safe_float(bar.get("v") or bar.get("volume"))),
                 "quote_ts": quote.get("t"),   # ISO timestamp for staleness check
             })
 

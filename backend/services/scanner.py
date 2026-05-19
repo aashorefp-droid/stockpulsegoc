@@ -2,6 +2,7 @@
 Single-stock scan logic — reuses the full scoring pipeline.
 Designed to be called in parallel from the scanner router.
 """
+import os
 import requests
 import yfinance as yf
 import pandas as pd
@@ -18,6 +19,16 @@ from backend.services.analysis import (
 from backend.services.market_data import get_daily_bars_alpaca, get_five_min_bars_alpaca
 from backend.services.options import get_options_strategy, get_options_bias
 from backend.config import ALPACA_API_KEY, ALPACA_API_SECRET
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+_SCAN_INCLUDE_EARNINGS = _env_enabled("SCANNER_INCLUDE_EARNINGS")
+_SCAN_INCLUDE_NEWS = _env_enabled("SCANNER_INCLUDE_NEWS")
+_SCAN_INCLUDE_OPTIONS = _env_enabled("SCANNER_INCLUDE_OPTIONS")
+_SCAN_INCLUDE_SHORT_FLOAT = _env_enabled("SCANNER_INCLUDE_SHORT_FLOAT")
 
 # ── Watchlists ────────────────────────────────────────────────────────────────
 
@@ -1357,7 +1368,7 @@ def scan_single(ticker: str, as_of: Optional[str] = None) -> dict:
         # never let a news fetch break a scan.
         news_label, news_good, news_bad = "No", 0, 0
         news_headlines: list = []
-        if not is_etf:
+        if _SCAN_INCLUDE_NEWS and not is_etf:
             try:
                 from backend.services.news_sentiment import get_news_details
                 _nd = get_news_details(ticker)
@@ -1375,7 +1386,11 @@ def scan_single(ticker: str, as_of: Optional[str] = None) -> dict:
                 pass
 
         # Next scheduled earnings date (cached daily — best-effort).
-        next_earnings = None if is_etf else _next_earnings_cached(ticker)
+        next_earnings = (
+            _next_earnings_cached(ticker)
+            if (_SCAN_INCLUDE_EARNINGS and not is_etf)
+            else None
+        )
         # Seasonality is intentionally NOT computed here — it's fetched
         # on-demand via GET /api/scanner/seasonality (kept off the scan
         # hot path; see _seasonality_cached).
@@ -1408,7 +1423,7 @@ def scan_single(ticker: str, as_of: Optional[str] = None) -> dict:
         # Short interest (best-effort)
         short_pct = None
         sector = _sector_for_ticker(ticker)
-        if not is_etf:
+        if _SCAN_INCLUDE_SHORT_FLOAT and not is_etf:
             try:
                 info = yf.Ticker(ticker).info
                 v = info.get("shortPercentOfFloat")
@@ -1417,12 +1432,14 @@ def scan_single(ticker: str, as_of: Optional[str] = None) -> dict:
                 sector = _sector_for_ticker(ticker, info)
             except Exception:
                 pass
+        elif not is_etf:
+            short_pct = fundamentals.get("short_pct_float")
 
-        # Options strategy (best-effort — yfinance fallback, no Alpaca keys needed)
+        # Options strategy (Alpaca-only; keep off the scan hot path unless enabled).
         opt_strategy = opt_summary = opt_debit = opt_profit = opt_source = opt_quote_ts = None
         opt_legs = opt_width = opt_exp_short = opt_exp_long = opt_alt = None
         opt_liquid: list = []
-        if not is_etf:
+        if _SCAN_INCLUDE_OPTIONS and not is_etf:
             try:
                 strat = get_options_strategy(ticker, price, direction, ALPACA_API_KEY, ALPACA_API_SECRET)
                 if strat and strat.get("summary"):
@@ -1440,10 +1457,10 @@ def scan_single(ticker: str, as_of: Optional[str] = None) -> dict:
             except Exception:
                 pass
 
-        # OTM liquid options (best-effort)
-        if not is_etf:
+        # OTM liquid options (Alpaca-only; optional because it adds one API call).
+        if _SCAN_INCLUDE_OPTIONS and not is_etf:
             try:
-                bias = get_options_bias(ticker)
+                bias = get_options_bias(ticker, price, ALPACA_API_KEY, ALPACA_API_SECRET)
                 opt_liquid = bias.get("otm_liquid", [])[:5]
             except Exception:
                 pass

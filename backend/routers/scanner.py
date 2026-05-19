@@ -80,9 +80,9 @@ async def stream_scan(
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue = asyncio.Queue()
         try:
-            worker_limit = int(os.getenv("SCANNER_MAX_WORKERS", "8"))
+            worker_limit = int(os.getenv("SCANNER_MAX_WORKERS", "5"))
         except ValueError:
-            worker_limit = 8
+            worker_limit = 5
         max_workers = max(1, min(len(tickers), worker_limit))
 
         async def _scan_all():
