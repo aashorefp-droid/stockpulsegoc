@@ -5,6 +5,8 @@ Final message: {"done": true, "total": N}
 """
 import json
 import asyncio
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
@@ -77,13 +79,22 @@ async def stream_scan(
     async def generate():
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue = asyncio.Queue()
+        try:
+            worker_limit = int(os.getenv("SCANNER_MAX_WORKERS", "8"))
+        except ValueError:
+            worker_limit = 8
+        max_workers = max(1, min(len(tickers), worker_limit))
 
         async def _scan_all():
-            futures = [loop.run_in_executor(None, scan_single, t, as_of) for t in tickers]
-            for coro in asyncio.as_completed(futures):
-                result = await coro
-                await queue.put(result)
-            await queue.put(None)  # sentinel — done
+            pool = ThreadPoolExecutor(max_workers=max_workers)
+            try:
+                futures = [loop.run_in_executor(pool, scan_single, t, as_of) for t in tickers]
+                for coro in asyncio.as_completed(futures):
+                    result = await coro
+                    await queue.put(result)
+            finally:
+                pool.shutdown(wait=False, cancel_futures=False)
+                await queue.put(None)  # sentinel — done
 
         asyncio.create_task(_scan_all())
 

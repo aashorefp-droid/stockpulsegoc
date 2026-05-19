@@ -72,6 +72,8 @@ ETF_SECTORS: dict[str, str] = {
     "XLU": "Utilities", "VPU": "Utilities", "IDU": "Utilities",
     "XLV": "Health Care", "VHT": "Health Care", "IXJ": "Health Care",
     "XLY": "Discretionary", "VCR": "Discretionary", "RXI": "Discretionary",
+    "DIA": "Dow 30", "IWM": "Russell 2000",
+    "ARKK": "Innovation", "SOXX": "Semiconductors", "SMH": "Semiconductors",
     "GLD": "Gold", "GLDM": "Gold", "SLV": "Silver",
     "DBMF": "Managed Futures", "CTA": "Managed Futures", "HFGM": "Alternatives",
     "PPI": "Inflation", "RINF": "Inflation",
@@ -94,6 +96,36 @@ def _sector_for_ticker(ticker: str, info: Optional[dict] = None) -> str:
     if info.get("quoteType") == "ETF":
         return "ETF"
     return "Unknown"
+
+
+def _is_etf_symbol(ticker: str) -> bool:
+    return (ticker or "").upper() in ETF_SECTORS
+
+
+def _etf_fundamentals(ticker: str, price: float) -> dict:
+    sector = _sector_for_ticker(ticker)
+    return {
+        "name": ticker,
+        "sector": sector,
+        "industry": "ETF",
+        "market_cap": "N/A",
+        "price": price,
+        "target_mean_price": None,
+        "pe_ratio": "N/A",
+        "forward_pe": "N/A",
+        "price_to_book": "N/A",
+        "price_to_sales": "N/A",
+        "enterprise_to_revenue": "N/A",
+        "enterprise_to_ebitda": "N/A",
+        "eps": "N/A",
+        "profit_margin": None,
+        "dividend_yield": None,
+        "52w_high": "N/A",
+        "52w_low": "N/A",
+        "avg_volume": "N/A",
+        "beta": "N/A",
+        "description": f"{ticker} ETF / fund.",
+    }
 
 
 # ── Live short-squeeze fetcher ─────────────────────────────────────────────────
@@ -1218,6 +1250,9 @@ _NEXT_EARN_CACHE: dict = {}   # {ticker: (date_cached, value)} — refreshed dai
 _SEASONALITY_CACHE: dict = {}   # {(ticker, "YYYY-MM"): dict} — refreshed monthly
 
 
+_FUND_CACHE: dict = {}
+
+
 def _seasonality_cached(ticker: str) -> dict:
     """Current-month seasonality, cached per ticker per calendar month."""
     today = date.today()
@@ -1249,8 +1284,24 @@ def _next_earnings_cached(ticker: str) -> Optional[str]:
     return val
 
 
+def _fundamentals_cached(ticker: str) -> dict:
+    """Fundamentals are slow yfinance quoteSummary calls; cache once per day."""
+    today = date.today()
+    hit = _FUND_CACHE.get(ticker)
+    if hit and hit[0] == today:
+        return hit[1]
+    try:
+        val = get_fundamentals(ticker) or {}
+    except Exception:
+        val = {}
+    _FUND_CACHE[ticker] = (today, val)
+    return val
+
+
 def scan_single(ticker: str, as_of: Optional[str] = None) -> dict:
     try:
+        ticker = (ticker or "").strip().upper()
+        is_etf = _is_etf_symbol(ticker)
         if as_of:
             end = date.fromisoformat(as_of)
             # Roll back to Friday if weekend
@@ -1306,24 +1357,25 @@ def scan_single(ticker: str, as_of: Optional[str] = None) -> dict:
         # never let a news fetch break a scan.
         news_label, news_good, news_bad = "No", 0, 0
         news_headlines: list = []
-        try:
-            from backend.services.news_sentiment import get_news_details
-            _nd = get_news_details(ticker)
-            news_label = _nd.get("label", "No")
-            news_good  = _nd.get("good_score", 0)
-            news_bad   = _nd.get("bad_score", 0)
-            news_headlines = [
-                {"h": (x.get("headline") or "")[:140],
-                 "s": x.get("sentiment", "Neutral"),
-                 "src": x.get("source", ""),
-                 "t": (f'{x.get("date","")} {x.get("time","")}').strip()}
-                for x in (_nd.get("headlines") or [])[:12]
-            ]
-        except Exception:
-            pass
+        if not is_etf:
+            try:
+                from backend.services.news_sentiment import get_news_details
+                _nd = get_news_details(ticker)
+                news_label = _nd.get("label", "No")
+                news_good  = _nd.get("good_score", 0)
+                news_bad   = _nd.get("bad_score", 0)
+                news_headlines = [
+                    {"h": (x.get("headline") or "")[:140],
+                     "s": x.get("sentiment", "Neutral"),
+                     "src": x.get("source", ""),
+                     "t": (f'{x.get("date","")} {x.get("time","")}').strip()}
+                    for x in (_nd.get("headlines") or [])[:12]
+                ]
+            except Exception:
+                pass
 
         # Next scheduled earnings date (cached daily — best-effort).
-        next_earnings = _next_earnings_cached(ticker)
+        next_earnings = None if is_etf else _next_earnings_cached(ticker)
         # Seasonality is intentionally NOT computed here — it's fetched
         # on-demand via GET /api/scanner/seasonality (kept off the scan
         # hot path; see _seasonality_cached).
@@ -1340,7 +1392,7 @@ def scan_single(ticker: str, as_of: Optional[str] = None) -> dict:
             vol_trend=vol_profile.get("vol_trend", "N/A"),
             trade=trade,
         )
-        fundamentals = get_fundamentals(ticker) or {}
+        fundamentals = _etf_fundamentals(ticker, price) if is_etf else _fundamentals_cached(ticker)
         fundamentals.setdefault("price", price)
         fundamental_signals = _fundamental_signals(ticker, fundamentals)
         valuation = _valuation_estimate(fundamentals)
@@ -1356,42 +1408,45 @@ def scan_single(ticker: str, as_of: Optional[str] = None) -> dict:
         # Short interest (best-effort)
         short_pct = None
         sector = _sector_for_ticker(ticker)
-        try:
-            info = yf.Ticker(ticker).info
-            v = info.get("shortPercentOfFloat")
-            if v is not None:
-                short_pct = round(float(v) * 100, 1)
-            sector = _sector_for_ticker(ticker, info)
-        except Exception:
-            pass
+        if not is_etf:
+            try:
+                info = yf.Ticker(ticker).info
+                v = info.get("shortPercentOfFloat")
+                if v is not None:
+                    short_pct = round(float(v) * 100, 1)
+                sector = _sector_for_ticker(ticker, info)
+            except Exception:
+                pass
 
         # Options strategy (best-effort — yfinance fallback, no Alpaca keys needed)
         opt_strategy = opt_summary = opt_debit = opt_profit = opt_source = opt_quote_ts = None
         opt_legs = opt_width = opt_exp_short = opt_exp_long = opt_alt = None
         opt_liquid: list = []
-        try:
-            strat = get_options_strategy(ticker, price, direction, ALPACA_API_KEY, ALPACA_API_SECRET)
-            if strat and strat.get("summary"):
-                opt_strategy  = strat.get("strategy")
-                opt_summary   = strat.get("summary")
-                opt_debit     = strat.get("net_debit")
-                opt_profit    = strat.get("max_profit")
-                opt_source    = strat.get("source")
-                opt_quote_ts  = strat.get("quote_ts")
-                opt_legs      = strat.get("legs")
-                opt_width     = strat.get("width")
-                opt_exp_short = strat.get("exp_short")
-                opt_exp_long  = strat.get("exp_long")
-                opt_alt       = strat.get("alt")
-        except Exception:
-            pass
+        if not is_etf:
+            try:
+                strat = get_options_strategy(ticker, price, direction, ALPACA_API_KEY, ALPACA_API_SECRET)
+                if strat and strat.get("summary"):
+                    opt_strategy  = strat.get("strategy")
+                    opt_summary   = strat.get("summary")
+                    opt_debit     = strat.get("net_debit")
+                    opt_profit    = strat.get("max_profit")
+                    opt_source    = strat.get("source")
+                    opt_quote_ts  = strat.get("quote_ts")
+                    opt_legs      = strat.get("legs")
+                    opt_width     = strat.get("width")
+                    opt_exp_short = strat.get("exp_short")
+                    opt_exp_long  = strat.get("exp_long")
+                    opt_alt       = strat.get("alt")
+            except Exception:
+                pass
 
         # OTM liquid options (best-effort)
-        try:
-            bias = get_options_bias(ticker)
-            opt_liquid = bias.get("otm_liquid", [])[:5]
-        except Exception:
-            pass
+        if not is_etf:
+            try:
+                bias = get_options_bias(ticker)
+                opt_liquid = bias.get("otm_liquid", [])[:5]
+            except Exception:
+                pass
 
         # Backtest only: one forward-bar fetch powers both metrics.
         # Next-day close stays long-only (UI labels it so); the swing-plan
