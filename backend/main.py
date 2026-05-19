@@ -1,16 +1,35 @@
 import os
 import logging
+import tempfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from backend.routers import analysis, scanner, earnings, tracker, macro, telegram
-from backend.routers import scheduler as scheduler_router
-from backend.services.scheduler import scheduler, setup_scheduler
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
 )
+logger = logging.getLogger(__name__)
+
+
+def _configure_yfinance() -> None:
+    cache_setting = os.getenv("YFINANCE_CACHE_DIR", "").strip()
+    cache_dir = Path(cache_setting) if cache_setting else Path(tempfile.gettempdir()) / "py-yfinance"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        import yfinance as yf
+        yf.set_tz_cache_location(str(cache_dir))
+        logging.getLogger("yfinance").setLevel(logging.WARNING)
+    except Exception as exc:
+        logger.warning("yfinance cache configuration skipped: %s", exc)
+
+
+_configure_yfinance()
+
+from backend.routers import analysis, scanner, earnings, tracker, macro, telegram
+from backend.routers import scheduler as scheduler_router
+from backend.services.scheduler import scheduler, setup_scheduler
 
 
 @asynccontextmanager

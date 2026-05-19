@@ -27,7 +27,7 @@ def _env_enabled(name: str, default: str = "0") -> bool:
 
 _SCAN_INCLUDE_EARNINGS = _env_enabled("SCANNER_INCLUDE_EARNINGS")
 _SCAN_INCLUDE_NEWS = _env_enabled("SCANNER_INCLUDE_NEWS")
-_SCAN_INCLUDE_OPTIONS = _env_enabled("SCANNER_INCLUDE_OPTIONS")
+_SCAN_INCLUDE_OPTIONS = _env_enabled("SCANNER_INCLUDE_OPTIONS", "1")
 _SCAN_INCLUDE_SHORT_FLOAT = _env_enabled("SCANNER_INCLUDE_SHORT_FLOAT")
 
 # ── Watchlists ────────────────────────────────────────────────────────────────
