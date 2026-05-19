@@ -13,6 +13,7 @@ import logging
 import math
 import time
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 import requests
 
@@ -27,6 +28,11 @@ _CACHE_TTL = 300             # SPY — matches macro cache (5 min)
 _SECTOR_CACHE_TTL = 1800     # sectors — 30 min (Alpaca/yf chains are heavy)
 
 _STRUCTURAL_THRESHOLD = 10  # consecutive same-sign days = regime, not a dip
+_MARKET_TZ = ZoneInfo("America/New_York")
+
+
+def _market_day() -> date:
+    return datetime.now(_MARKET_TZ).date()
 
 
 def _record_and_streak(net_gex: float, symbol: str = "SPY") -> dict:
@@ -36,12 +42,13 @@ def _record_and_streak(net_gex: float, symbol: str = "SPY") -> dict:
     uses the per-symbol gex_history_sym table.
     """
     sign = 1 if net_gex > 0 else (-1 if net_gex < 0 else 0)
+    day = _market_day().isoformat()
     try:
         if symbol == "SPY":
-            gex_store.record_sign(sign)
+            gex_store.record_sign(sign, day=day)
             hist = gex_store.load_history()
         else:
-            gex_store.record_sign_sym(symbol, sign)
+            gex_store.record_sign_sym(symbol, sign, day=day)
             hist = gex_store.load_history_sym(symbol)
     except Exception as e:
         # DB unreachable — degrade gracefully, just report today. Loud on
@@ -53,7 +60,12 @@ def _record_and_streak(net_gex: float, symbol: str = "SPY") -> dict:
             "single day; check DATABASE_URL / Neon. err=%s",
             symbol, gex_store.backend_name(), str(e)[:160],
         )
-        hist = {date.today().isoformat(): sign}
+        hist = {day: sign}
+
+    # Render runs in UTC. If an older build wrote tomorrow's UTC date while
+    # it was still today's US market session, ignore that future row until the
+    # market timezone catches up.
+    hist = {d: s for d, s in hist.items() if d <= day}
 
     streak = 0
     last_sign = None
@@ -142,7 +154,7 @@ def _fetch_spy_chain_cboe(spot_hint: float = 0) -> tuple[list[dict], float]:
     if not options:
         return [], spot
 
-    today   = date.today()
+    today   = _market_day()
     exp_min = (today + timedelta(days=2))
     exp_max = (today + timedelta(days=45))
     s_lo    = spot * 0.85 if spot else 0
@@ -180,7 +192,7 @@ def _fetch_spy_chain_cboe(spot_hint: float = 0) -> tuple[list[dict], float]:
 
 
 def _fetch_chain(symbol: str, spot: float) -> list[dict]:
-    today    = date.today()
+    today    = _market_day()
     exp_min  = (today + timedelta(days=2)).isoformat()
     exp_max  = (today + timedelta(days=45)).isoformat()
     s_lo     = spot * 0.85
@@ -270,7 +282,7 @@ def _fetch_chain_yfinance(symbol: str, spot: float) -> list[dict]:
     if not expirations:
         return []
 
-    today    = date.today()
+    today    = _market_day()
     exp_min  = (today + timedelta(days=2)).isoformat()
     exp_max  = (today + timedelta(days=45)).isoformat()
     s_lo     = spot * 0.85
@@ -358,7 +370,7 @@ def compute_gex(symbol: str, use_cboe: bool = False) -> dict:
         return {"available": False,
                 "reason": "options chain empty (cboe + alpaca + yfinance)"}
 
-    today = date.today()
+    today = _market_day()
     call_gex = 0.0
     put_gex  = 0.0
     for c in contracts:

@@ -254,7 +254,7 @@ def macro_snapshot():
         "items": items,
         "risk":  {"score": risk_score, "label": risk_label, "notes": risk_notes},
         "economic_events": _economic_events(),
-        "econ_refresh_date": date.today().isoformat(),
+        "econ_refresh_date": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
         "gex": gex,
         "btd": btd,
     }
