@@ -51,8 +51,11 @@ app.include_router(telegram.router)
 @app.get("/health")
 def health():
     from backend.services.scheduler import scheduler as sched
+    from backend.db import gex_store
     return {
         "status":          "ok",
         "scheduler":       sched.running,
         "polling_active":  sched.get_job("eps_poll") is not None,
+        "spy_gamma_job":   sched.get_job("spy_gamma") is not None,
+        "gex_store":       gex_store.backend_name(),
     }
