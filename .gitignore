@@ -30,6 +30,8 @@ venv/
 *.db-shm
 *.db-wal
 backend/db/gex_history.json
+backend/db/macro_state.json
+backend/db/momentum_watchlist.json
 backend/services/.gmail_cache/
 backend/services/.watchlist_cache/
 *.log

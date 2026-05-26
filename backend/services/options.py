@@ -698,6 +698,32 @@ def _build_strategy(ticker: str, current_price: float, direction: str,
     def _zebra_max_extrinsic() -> float:
         return 0.05
 
+    def _butterfly_fills(buys: list, sell_body, width: float) -> dict:
+        """Estimate what the market would actually give you, not mid.
+
+        Entry at market: pay ASK on buy legs, receive BID on sell legs.
+        Close at market: sell buy legs at BID, buy back sell legs at ASK.
+        The round-trip cost (`slip = natural - close`) is the all-in fill
+        haircut a butterfly suffers from crossing 4 bid/ask spreads going
+        in plus 4 coming out (2 of them on the doubled body). On OTM-wing
+        flies this is routinely 30–50% of width on liquid names and worse
+        on illiquid ones — which is why displayed Max ≠ realized exit.
+        """
+        def _b(c): return c["bid"] if c and c.get("bid", 0) > 0 else 0.0
+        def _a(c): return c["ask"] if c and c.get("ask", 0) > 0 else 0.0
+        natural = round(_a(buys[0]) + _a(buys[1]) - 2 * _b(sell_body), 2)
+        close   = round(_b(buys[0]) + _b(buys[1]) - 2 * _a(sell_body), 2)
+        slip    = round(natural - close, 2)
+        if close <= 0 or _a(sell_body) <= 0:
+            tag = "⚠ no exit liquidity"
+        elif width > 0 and slip / width > 0.30:
+            tag = "⚠ wide fills"
+        elif width > 0 and slip / width <= 0.10:
+            tag = "tight fills"
+        else:
+            tag = "okay fills"
+        return {"natural": natural, "close": close, "slip": slip, "tag": tag}
+
     def _butterfly_fit(debit: float, width: float) -> str:
         if atm_iv is None:
             return "IV fit: unknown"
@@ -781,10 +807,13 @@ def _build_strategy(ticker: str, current_price: float, direction: str,
         if not _validate_spread(debit, width):
             return None
         debit_pct = debit / width * 100 if width > 0 else 0
+        f = _butterfly_fills([lower, upper], body, width)
         return (
             f"Butterfly: Buy ${_strike(lower)}C / Sell 2x ${_strike(body)}C / "
-            f"Buy ${_strike(upper)}C Exp {exp_long} | Debit ~${debit:.2f} | "
-            f"Target ${_strike(body)} | Max ~${max_profit:.2f} | "
+            f"Buy ${_strike(upper)}C Exp {exp_long} | Debit ~${debit:.2f} "
+            f"(natural ${f['natural']:.2f}) | Target ${_strike(body)} | "
+            f"Max ~${max_profit:.2f} | Close ~${f['close']:.2f} "
+            f"(slip ${f['slip']:.2f}, {f['tag']}) | "
             f"{_iv_summary()} | {_butterfly_fit(debit, width)} | "
             f"Debit {debit_pct:.0f}% of width"
         )
@@ -808,10 +837,13 @@ def _build_strategy(ticker: str, current_price: float, direction: str,
         if not _validate_spread(debit, width):
             return None
         debit_pct = debit / width * 100 if width > 0 else 0
+        f = _butterfly_fills([upper, lower], body, width)
         return (
             f"Butterfly: Buy ${_strike(upper)}P / Sell 2x ${_strike(body)}P / "
-            f"Buy ${_strike(lower)}P Exp {exp_long} | Debit ~${debit:.2f} | "
-            f"Target ${_strike(body)} | Max ~${max_profit:.2f} | "
+            f"Buy ${_strike(lower)}P Exp {exp_long} | Debit ~${debit:.2f} "
+            f"(natural ${f['natural']:.2f}) | Target ${_strike(body)} | "
+            f"Max ~${max_profit:.2f} | Close ~${f['close']:.2f} "
+            f"(slip ${f['slip']:.2f}, {f['tag']}) | "
             f"{_iv_summary()} | {_butterfly_fit(debit, width)} | "
             f"Debit {debit_pct:.0f}% of width"
         )

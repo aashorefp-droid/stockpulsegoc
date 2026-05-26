@@ -12,6 +12,7 @@ RUN pip install --upgrade pip \
     && pip install -r backend/requirements.txt
 
 COPY backend ./backend
+COPY day_trading ./day_trading
 
 EXPOSE 8000
 

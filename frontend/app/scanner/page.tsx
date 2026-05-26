@@ -19,10 +19,10 @@ const WATCHLISTS = [
   { key: "custom",        label: "Custom",            count: 0   },
 ];
 
-type Filter = "all" | "actionable" | "rank1" | "exceptional" | "high_short" | "day_spring" | "lt_spring" | "quality_long" | "btd" | "btd_trigger" | "speculative" | "news_good" | "news_bad";
+type Filter = "all" | "actionable" | "rank1" | "exceptional" | "high_short" | "day_spring" | "lt_spring" | "sweep_reclaim_long" | "sweep_reclaim_short" | "breakout" | "quality_long" | "btd" | "btd_trigger" | "speculative" | "news_good" | "news_bad";
 
 const isBtdLive = (s?: string) => s === "TRIGGER" || s === "ARMED" || s === "ARMED-DEEP";
-type SortBy = "score" | "grade" | "rr" | "swingReward" | "dayReward" | "ltEntryPct" | "valuation" | "longRunway" | "cyclicalPeak" | "multiBagger" | "newsGood" | "newsBad";
+type SortBy = "score" | "grade" | "rr" | "swingReward" | "fibReward" | "dayReward" | "ltEntryPct" | "valuation" | "longRunway" | "cyclicalPeak" | "multiBagger" | "newsGood" | "newsBad";
 
 type Seasonality = {
   available?: boolean;
@@ -43,6 +43,7 @@ const SORT_OPTIONS: { key: SortBy; label: string; title?: string }[] = [
   { key: "grade",       label: "Grade" },
   { key: "rr",          label: "R/R" },
   { key: "swingReward", label: "Swing Reward%", title: "Sort by Swing target reward percent" },
+  { key: "fibReward",   label: "Fib Reward%",   title: "Sort by Fibonacci target reward percent" },
   { key: "dayReward",   label: "Day Reward%",   title: "Sort by Day Trading target reward percent" },
   { key: "ltEntryPct",  label: "LT Entry%",     title: "Sort by Long Term distance from entry" },
   { key: "valuation",   label: "Valuation",     title: "Sort by Long Term valuation estimate" },
@@ -108,6 +109,22 @@ interface ScanResult {
   near_fib_name?: string;
   near_fib_price?: number;
   fib_compression?: boolean;
+  fib_target?: number | null;
+  fib_target_name?: string | null;
+  fib_target_reward_pct?: number | null;
+  fib_target_source?: string | null;
+  fib_pos_pct?: number | null;
+  fib_swing_low?: number | null;
+  fib_swing_high?: number | null;
+  fib_swing_range?: number | null;
+  fib_earn_window?: string | null;
+  fib_prev_earnings?: string | null;
+  fib_last_earnings?: string | null;
+  fib_next_earnings?: string | null;
+  fib_commentary?: string | null;
+  weekly_pos_pct?: number | null;
+  weekly_fib_low?: number | null;
+  weekly_fib_high?: number | null;
   signals?:      string;
   valuation_label?: string;
   valuation_score?: number;
@@ -144,6 +161,53 @@ interface ScanResult {
   cpr_day_15m_volume_ratio?: number | null;
   cpr_day_15m_volume_surge?: boolean;
   cpr_day_ref?: string;
+  // ── Multi-timeframe S/R for the SWING column ────────────────────────────
+  prev_week_high?:  number | null;
+  prev_week_low?:   number | null;
+  prev_month_high?: number | null;
+  prev_month_low?:  number | null;
+  wk52_high?:       number | null;
+  wk52_low?:        number | null;
+  // V4 day-trading: PDH/PWH/PDL/PWL plan engine
+  dt4_enabled?: boolean | null;
+  dt4_setup?: string | null;
+  dt4_context?: string | null;
+  dt4_side?: string | null;
+  dt4_bias?: string | null;
+  dt4_grade?: string | null;
+  dt4_level?: string | null;
+  dt4_level_val?: number | null;
+  dt4_entry?: number | null;
+  dt4_stop?: number | null;
+  dt4_t1?: number | null;
+  dt4_t2?: number | null;
+  dt4_rr?: number | null;
+  dt4_trigger?: string | null;
+  dt4_invalidation?: string | null;
+  dt4_target_plan?: string | null;
+  dt4_exit_plan?: string | null;
+  dt4_note?: string | null;
+  dt4_pdh?: number | null;
+  dt4_pdl?: number | null;
+  dt4_pwh?: number | null;
+  dt4_pwl?: number | null;
+  dt4_atr?: number | null;
+  // ── V3 day-trading: PDH/PWH/PDL/PWL setup engine ────────────────────────
+  dt3_setup?:     string | null;   // "sweep_reclaim" | "break_retest" | "no_setup"
+  dt3_side?:      string | null;   // "long" | "short"
+  dt3_grade?:     string | null;   // "A+" | "A" | "B" | ...
+  dt3_level?:     string | null;   // "PWH" | "PDH" | "PWL" | "PDL"
+  dt3_level_val?: number | null;
+  dt3_entry?:     number | null;
+  dt3_stop?:      number | null;
+  dt3_t1?:        number | null;
+  dt3_t2?:        number | null;
+  dt3_rr?:        number | null;
+  dt3_rationale?: string | null;
+  dt3_pdh?:       number | null;
+  dt3_pdl?:       number | null;
+  dt3_pwh?:       number | null;
+  dt3_pwl?:       number | null;
   next_day_date?: string;
   next_day_outcome?: string;
   next_day_bias?: string;
@@ -414,6 +478,33 @@ function inOpeningVolumeRefreshWindow(): boolean {
   }
 }
 
+// V3 detectors can only fire inside two windows (matching day_trading/v3.py):
+//   09:50–11:00 ET (morning) and 13:30–15:30 ET (afternoon).
+// Outside these, polling is pointless — the engine returns no_setup by design.
+function inV3TradeWindow(): boolean {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date());
+    const get = (type: string) => parts.find(p => p.type === type)?.value ?? "";
+    const weekday = get("weekday");
+    if (weekday === "Sat" || weekday === "Sun") return false;
+    const hour = Number(get("hour")) % 24;
+    const minute = Number(get("minute"));
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) return false;
+    const mins = hour * 60 + minute;
+    const morning   = mins >= 9 * 60 + 50  && mins <= 11 * 60;
+    const afternoon = mins >= 13 * 60 + 30 && mins <= 15 * 60 + 30;
+    return morning || afternoon;
+  } catch {
+    return false;
+  }
+}
+
 function lreRangeText(r: ScanResult): string {
   if (r.lre_entry == null || r.lre_stop == null) return "—";
   const lo = Math.min(r.lre_entry, r.lre_stop);
@@ -495,7 +586,21 @@ export default function ScannerPage() {
   const [scanning,     setScanning]     = useState(false);
   const [results,      setResults]      = useState<ScanResult[]>([]);
   const [progress,     setProgress]     = useState({ done: 0, total: 0 });
-  const [filter,       setFilter]       = useState<Filter>("all");
+  // Per-scan opt-in to news fetching. The backend default is off (it adds
+  // ~0.5–2s/ticker), so this toggle lets the user pull news only when they
+  // need it for that particular scan run.
+  const [includeNews, setIncludeNews] = useState(false);
+  // Multi-select: empty set = "All" (show everything). Clicking a chip
+  // toggles its membership; clicking "All" clears the set.
+  const [filters, setFilters] = useState<Set<Filter>>(new Set());
+  const toggleFilter = (f: Filter) =>
+    setFilters(prev => {
+      const next = new Set(prev);
+      if (f === "all") { next.clear(); return next; }
+      if (next.has(f)) next.delete(f); else next.add(f);
+      return next;
+    });
+  const clearFilters = () => setFilters(new Set());
   const [sortBy,       setSortBy]       = useState<SortBy>("score");
   const [optModal,     setOptModal]     = useState<{ r: ScanResult } | null>(null);
   const [otmModal,     setOtmModal]     = useState<{ r: ScanResult } | null>(null);
@@ -510,6 +615,8 @@ export default function ScannerPage() {
   const [activeBacktestDate, setActiveBacktestDate] = useState<string | null>(null);
   const [sectorMacro,  setSectorMacro]  = useState<Record<string, MacroItem>>({});
   const [auto15mStatus, setAuto15mStatus] = useState("");
+  const [v3AutoStatus, setV3AutoStatus]   = useState("");
+  const v3BusyRef = useRef(false);
   const [telegramStatus, setTelegramStatus] = useState("");
   const [telegramSending, setTelegramSending] = useState(false);
   const [tgPulling, setTgPulling] = useState(false);
@@ -632,6 +739,114 @@ export default function ScannerPage() {
     };
   }, [mode, scanning, progress.done, progress.total, pending15mKey, results]);
 
+  // ── V3 auto-refresh ──────────────────────────────────────────────────────
+  // Re-evaluate ONLY the V3 day-trading engine for the current rows every 5
+  // min during V3 trade windows (09:50–11:00 ET + 13:30–15:30 ET). Skips
+  // the heavy scan_single pipeline; hits the cheap /v3-refresh endpoint
+  // which only computes day_trading.v3.analyze() per ticker.
+  useEffect(() => {
+    if (mode !== "live" || scanning ||
+        progress.total === 0 || progress.done < progress.total ||
+        results.length === 0 || !inV3TradeWindow()) {
+      return;
+    }
+
+    const refreshV3 = async () => {
+      if (v3BusyRef.current || !inV3TradeWindow()) return;
+
+      // Smart subset: rank by distance to the nearest watched level so we
+      // only spend yfinance calls on rows where V3 could plausibly fire.
+      // Always include: rows already firing (keep them updating live).
+      // Then: rows within 0.5% of a PWH/PWL/PDH/PDL. Then: top 10 closest
+      // as a "heartbeat floor" so something always refreshes during a cycle.
+      const NEAR_PCT = 0.005;
+      const MIN_FLOOR = 10;
+      type Cand = { tk: string; dist: number; firing: boolean; tier?: string };
+      const ranked: Cand[] = results.map(r => {
+        const tk = r.ticker.toUpperCase();
+        const firing = r.dt3_setup === "sweep_reclaim" || r.dt3_setup === "break_retest";
+        const p = r.price ?? 0;
+        const levels = [r.dt3_pwh, r.dt3_pwl, r.dt3_pdh, r.dt3_pdl]
+          .filter((l): l is number => l != null && l > 0);
+        const dist = (p > 0 && levels.length)
+          ? Math.min(...levels.map(l => Math.abs(p - l) / p))
+          : Infinity;
+        // Mirror the page.tsx filter tests for Actionable / Exceptional /
+        // Rank 1 (all subsume mtf_rank===1) → drives Telegram notify list.
+        let tier: string | undefined;
+        if (r.mtf_rank === 1) {
+          if (["S", "A"].includes(r.entry_grade ?? "") && r.vol_trend === "ACCUMULATING") tier = "Exceptional";
+          else if (r.lre_status === "ACTIVE" || r.lre_status === "DISCOUNT") tier = "Actionable";
+          else tier = "Rank 1";
+        }
+        return { tk, dist, firing, tier };
+      });
+      ranked.sort((a, b) => {
+        if (a.firing !== b.firing) return a.firing ? -1 : 1;
+        return a.dist - b.dist;
+      });
+
+      const pick = new Map<string, Cand>();
+      ranked.forEach((c, i) => {
+        if (c.firing || c.dist <= NEAR_PCT || i < MIN_FLOOR) pick.set(c.tk, c);
+      });
+      const tickers = Array.from(pick.keys()).slice(0, 80);
+      if (!tickers.length) return;
+
+      // Notify allowlist: tier-eligible rows among the refresh set.
+      const notify: Record<string, string> = {};
+      tickers.forEach(tk => {
+        const c = pick.get(tk);
+        if (c?.tier) notify[tk] = c.tier;
+      });
+
+      v3BusyRef.current = true;
+      const notifyCount = Object.keys(notify).length;
+      setV3AutoStatus(
+        `Auto-updating V3 (${tickers.length} of ${results.length} · ${notifyCount} alert-eligible)`
+      );
+      try {
+        const res = await fetch(`${API_BASE}/api/scanner/v3-refresh`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tickers, notify }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const j = await res.json();
+        const updates: Record<string, Partial<ScanResult>> = j?.results ?? {};
+        const hits = Object.keys(updates).length;
+        if (hits) {
+          setResults(prev => prev.map(r => {
+            const u = updates[r.ticker.toUpperCase()];
+            return u ? { ...r, ...u } : r;
+          }));
+        }
+        const fired = Object.values(updates).filter(u =>
+          u?.dt3_setup && u.dt3_setup !== "no_setup" && u.dt3_setup !== "error"
+        ).length;
+        setV3AutoStatus(
+          fired > 0
+            ? `V3 updated — ${fired} firing of ${hits}`
+            : `V3 updated — ${hits} watching`
+        );
+        window.setTimeout(() => setV3AutoStatus(""), 4000);
+      } catch (e) {
+        setV3AutoStatus("V3 auto-update paused");
+      } finally {
+        v3BusyRef.current = false;
+      }
+    };
+
+    // First fire after 15s (let initial render settle), then every 5 min.
+    // 5 min matches the 5m bar cadence v3 keys off of — faster is wasted.
+    const first = window.setTimeout(refreshV3, 15_000);
+    const every = window.setInterval(refreshV3, 5 * 60_000);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(every);
+    };
+  }, [mode, scanning, progress.done, progress.total, results.length]);
+
   function copyText(text: string) {
     navigator.clipboard.writeText(text).catch(() => {});
     setCopied(true);
@@ -639,7 +854,7 @@ export default function ScannerPage() {
   }
 
   // Watchlists with daily-saved snapshots — load instantly instead of running a live scan.
-  const SNAPSHOT_WATCHLISTS = ["nyse_swing", "nasdaq_swing"];
+  const SNAPSHOT_WATCHLISTS = ["default", "momentum", "nyse_swing", "nasdaq_swing"];
   const [snapshotStatus, setSnapshotStatus] = useState<string>("");
 
   async function fetchSnapshot(key: string) {
@@ -698,7 +913,7 @@ export default function ScannerPage() {
       setWatchlist("custom");
     }
 
-    // For NYSE/NASDAQ swing in live mode, prefer the saved snapshot (faster).
+    // For saved daily snapshots in live mode, prefer the Neon-backed snapshot (faster).
     if (mode === "live" && SNAPSHOT_WATCHLISTS.includes(scanWatchlist)) {
       loadSnapshot(scanWatchlist);
       return;
@@ -725,6 +940,7 @@ export default function ScannerPage() {
     } else {
       setActiveBacktestDate(null);
     }
+    if (includeNews) url += `&include_news=1`;
 
     setProgress({ done: 0, total });
     setScanning(true);
@@ -808,6 +1024,7 @@ export default function ScannerPage() {
       } else {
         url = `${API_BASE}/api/scanner/stream?watchlist=${watchlist}&as_of=${asOf}`;
       }
+      if (includeNews) url += `&include_news=1`;
       const acc: ScanResult[] = [];
       const es = new EventSource(url);
       poolEsRef.current = es;
@@ -865,44 +1082,80 @@ export default function ScannerPage() {
   }
 
   const gradeRank: Record<string, number> = { S: 0, A: 1, B: 2, "B-": 3, C: 4, D: 5 };
+  const isSweepReclaimLong = (r: ScanResult) =>
+    r.dt4_setup === "sweep_reclaim_long"
+    || (r.dt3_setup === "sweep_reclaim" && r.dt3_side === "long");
+  const isSweepReclaimShort = (r: ScanResult) =>
+    r.dt4_setup === "sweep_reject_short"
+    || (r.dt3_setup === "sweep_reclaim" && r.dt3_side === "short");
+  // "Breakout" = price is clearing (or hugging within 0.5%) a higher-
+  // timeframe resistance, OR an engine confirmed a long-side break+retest.
+  // Long-side only — a downside break is a "breakdown", separate concept.
+  const isBreakout = (r: ScanResult): boolean => {
+    const p = r.price ?? 0;
+    if (p <= 0) return false;
+    // Confirmed structural break+retest from V3
+    if (r.dt3_setup === "break_retest" && r.dt3_side === "long") return true;
+    // V4 setup tagged as a break (long-side)
+    if (r.dt4_setup
+        && r.dt4_setup.toLowerCase().includes("break")
+        && r.dt4_side !== "short") return true;
+    // Price clearing prior month high or 52-week high (within 0.5% below
+    // qualifies — captures the moment of breakout as well as the hold).
+    const cleared = (lvl?: number | null) =>
+      lvl != null && lvl > 0 && p >= lvl * 0.995;
+    return cleared(r.wk52_high) || cleared(r.prev_month_high);
+  };
   const tickerFilterTokens = tickerFilter
     .split(/[\s,]+/)
     .map(t => t.trim().toUpperCase())
     .filter(Boolean);
 
-  const filtered = results
-    .filter(r => !r.error && r.verdict)
-    .filter(r => tickerFilterTokens.length === 0 || tickerFilterTokens.includes(r.ticker.toUpperCase()))
-    .filter(r => {
-      if (filter === "rank1")     return r.mtf_rank === 1;
-      if (filter === "high_short") return (r.short_pct ?? 0) >= 10;
-      if (filter === "btd")       return isBtdLive(r.btd_state);
-      if (filter === "btd_trigger") return r.btd_state === "TRIGGER";
-      if (filter === "day_spring") return !!r.day_spring;
-      if (filter === "lt_spring")  return !!r.long_term_spring;
-      if (filter === "quality_long")
+  // Single-filter predicate — extracted so both the row filter (union match
+  // across selected chips) and the chip count badges share the exact same
+  // logic. Returns true for "all" so callers can pass it freely.
+  const passesFilter = (r: ScanResult, f: Filter): boolean => {
+    switch (f) {
+      case "rank1":               return r.mtf_rank === 1;
+      case "high_short":          return (r.short_pct ?? 0) >= 10;
+      case "btd":                 return isBtdLive(r.btd_state);
+      case "btd_trigger":         return r.btd_state === "TRIGGER";
+      case "day_spring":          return !!r.day_spring;
+      case "lt_spring":           return !!r.long_term_spring;
+      case "sweep_reclaim_long":  return isSweepReclaimLong(r);
+      case "sweep_reclaim_short": return isSweepReclaimShort(r);
+      case "breakout":            return isBreakout(r);
+      case "quality_long":
         return r.lre_score === 3
           && (r.verdict === "BULLISH" || r.verdict === "LEAN BULLISH")
           && r.confidence === "STRONG";
-      // Matches original: score≥4 + HIGH conf + grade A/S + rank1 + ACCUMULATING vol
-      if (filter === "exceptional")
+      case "exceptional":
         return ["S", "A"].includes(r.entry_grade ?? "")
           && r.mtf_rank === 1
           && r.vol_trend === "ACCUMULATING";
-      // Actionable = MTF rank 1 + LRE entry zone live (ACTIVE or DISCOUNT)
-      if (filter === "actionable")
+      case "actionable":
         return r.mtf_rank === 1
           && (r.lre_status === "ACTIVE" || r.lre_status === "DISCOUNT");
-      if (filter === "speculative") return !!r.multi_bagger || !!r.long_runway;
-      if (filter === "news_good")   return r.news === "Good";
-      if (filter === "news_bad")    return r.news === "Bad";
-      return true;
-    })
+      case "speculative":         return !!r.multi_bagger || !!r.long_runway;
+      case "news_good":           return r.news === "Good";
+      case "news_bad":             return r.news === "Bad";
+      default:                    return true;   // "all"
+    }
+  };
+
+  const filtered = results
+    .filter(r => !r.error && r.verdict)
+    .filter(r => tickerFilterTokens.length === 0 || tickerFilterTokens.includes(r.ticker.toUpperCase()))
+    // Multi-filter: empty set = no filter. Otherwise the row passes if it
+    // matches ANY selected chip (union/OR). Switch to .every(...) for
+    // intersection/AND behaviour if you prefer narrower matches.
+    .filter(r => filters.size === 0 || Array.from(filters).some(f => passesFilter(r, f)))
     .sort((a, b) => {
       if (sortBy === "score")  return Math.abs(b.score ?? 0) - Math.abs(a.score ?? 0);
       if (sortBy === "grade")  return (gradeRank[a.entry_grade ?? "D"] ?? 5) - (gradeRank[b.entry_grade ?? "D"] ?? 5);
       if (sortBy === "rr")     return (b.rr_t1 ?? 0) - (a.rr_t1 ?? 0);
       if (sortBy === "swingReward") return rewardPctValue(b.entry, b.target1) - rewardPctValue(a.entry, a.target1);
+      if (sortBy === "fibReward")   return (b.fib_target_reward_pct ?? 0) - (a.fib_target_reward_pct ?? 0);
       if (sortBy === "dayReward")   return rewardPctValue(b.cpr_day_entry, b.cpr_day_t1) - rewardPctValue(a.cpr_day_entry, a.cpr_day_t1);
       if (sortBy === "ltEntryPct")  return longTermFromEntryPctValue(b) - longTermFromEntryPctValue(a);
       if (sortBy === "valuation")   return valuationSortValue(b) - valuationSortValue(a);
@@ -978,6 +1231,20 @@ export default function ScannerPage() {
             </button>
           </div>
           <button
+            onClick={() => setIncludeNews(v => !v)}
+            disabled={scanning}
+            title={includeNews
+              ? "News fetching ON for this scan — adds ~0.5–2s per non-ETF ticker. Click to disable."
+              : "News fetching OFF — click to enable for the next scan. Adds latency but populates News column / filters."}
+            className={`shrink-0 px-3 py-1.5 rounded-lg font-semibold text-xs uppercase tracking-wide transition-colors border ${
+              includeNews
+                ? "bg-accent/20 text-accent border-accent/40"
+                : "bg-transparent text-muted border-border hover:text-white"
+            } ${scanning ? "opacity-50 cursor-not-allowed" : ""}`}
+          >
+            📰 {includeNews ? "News ON" : "News"}
+          </button>
+          <button
             onClick={scanning ? stopScan : () => startScan()}
             disabled={!scanning && mode === "backtest" && !backtestDate}
             className={`shrink-0 px-6 py-1.5 rounded-lg font-bold text-sm uppercase tracking-wide transition-all ${
@@ -1019,6 +1286,7 @@ export default function ScannerPage() {
                 )}
                 {snapshotStatus && <span className="text-accent">{snapshotStatus}</span>}
                 {auto15mStatus && <span className="text-yellow">{auto15mStatus}</span>}
+                {v3AutoStatus  && <span className="text-accent">{v3AutoStatus}</span>}
                 {telegramStatus && (
                   <span className={telegramStatus.startsWith("Telegram failed") ? "text-red" : "text-green"}>
                     {telegramStatus}
@@ -1557,13 +1825,23 @@ export default function ScannerPage() {
       {/* ── Filter + Sort ── */}
       {results.length > 0 && (
         <div className="flex flex-wrap gap-4 items-center">
-          <div className="flex gap-1 bg-card border border-border rounded-lg p-1">
-            {(["all", "actionable", "rank1", "exceptional", "high_short", "btd", "btd_trigger", "day_spring", "lt_spring", "quality_long", "speculative", "news_good", "news_bad"] as Filter[]).map(f => (
-              <button key={f} onClick={() => setFilter(f)}
+          <div
+            className="flex flex-wrap gap-1 bg-card border border-border rounded-lg p-1"
+            title="Click a chip to toggle it. Stack multiple chips for an OR-match. Click All (or right-click any chip) to reset."
+          >
+            {(["all", "actionable", "rank1", "exceptional", "high_short", "btd", "btd_trigger", "day_spring", "lt_spring", "sweep_reclaim_long", "sweep_reclaim_short", "breakout", "quality_long", "speculative", "news_good", "news_bad"] as Filter[]).map(f => {
+              const active = f === "all" ? filters.size === 0 : filters.has(f);
+              return (
+              <button key={f}
+                onClick={() => toggleFilter(f)}
+                onContextMenu={(e) => { e.preventDefault(); clearFilters(); }}
                 className={`px-3 py-1 text-xs rounded-md font-semibold transition-colors ${
-                  filter === f ? "bg-accent text-black" : "text-muted hover:text-white"
+                  active ? "bg-accent text-black" : "text-muted hover:text-white"
                 }`}>
-                {f === "all"         ? `All (${results.filter(r => !r.error).length})`
+                {f === "sweep_reclaim_long" ? `Sweep Reclaim Long (${results.filter(isSweepReclaimLong).length})`
+                : f === "sweep_reclaim_short" ? `Sweep Reclaim Short (${results.filter(isSweepReclaimShort).length})`
+                : f === "breakout"   ? `🚀 Breakout (${results.filter(isBreakout).length})`
+                : f === "all"         ? `All (${results.filter(r => !r.error).length})`
                 : f === "actionable" ? `🎯 Actionable (${results.filter(r => r.mtf_rank === 1 && (r.lre_status === "ACTIVE" || r.lre_status === "DISCOUNT")).length})`
                 : f === "rank1"      ? `Rank 1 (${results.filter(r => r.mtf_rank === 1).length})`
                 : f === "high_short" ? `🔥 High Short (${results.filter(r => (r.short_pct ?? 0) >= 10).length})`
@@ -1577,7 +1855,8 @@ export default function ScannerPage() {
                 : f === "news_bad"   ? `📰 Bad News (${results.filter(r => r.news === "Bad").length})`
                 : `Exceptional (${results.filter(r => ["S","A"].includes(r.entry_grade ?? "") && r.mtf_rank === 1 && r.vol_trend === "ACCUMULATING").length})`}
               </button>
-            ))}
+              );
+            })}
           </div>
 
           <div className="flex flex-wrap items-center gap-1 text-xs text-muted">
@@ -1609,8 +1888,11 @@ export default function ScannerPage() {
                 "Ticker","Sector","Price","Verdict","BTD","BTD Zone","Long Term Grade","Long Term Status",
                 "Verdict Flip Date","Verdict Flip From","Days Since Flip",
                 "Long Term Entry Range","Long Term % From Entry","Long Term Risk%","Long Term Spring","Valuation","Valuation Fair Value","Valuation Upside%","Valuation Source","Valuation Reason",
-                "Swing Entry","Swing Stop","Swing T1","Swing Reward%","Swing Risk%","Swing R/R","Swing Invalidation","Swing Spring","News","Next Earnings",
+                "Swing Entry","Swing Stop","Swing T1","Swing Reward%","Swing Risk%","Swing R/R","Swing Invalidation","Swing Spring",
+                "Fib Target","Fib Reward%","Fib Level","Fib Source","Fib Commentary","Prev Earnings","Last Earnings","Next Earnings (Fib)","Earn Zone","Weekly Zone","Nearest Fib","Fib Compression",
+                "News","Next Earnings",
                 "Day Trading Result","Day Trading Entry","Day Trading Stop","Day Trading T1","Day Trading Reward%","Day Trading Spring","Day Trading Trigger","Day Trading Invalidation","Day Trading Target Plan","Day Trading Volume Confirm","Day Trading 15m Volume Confirm","Day Trading Ref",
+                "Day Trading V4 Context","Day Trading V4 Setup","Day Trading V4 Side","Day Trading V4 Grade","Day Trading V4 Level","Day Trading V4 Watch","Day Trading V4 Stop","Day Trading V4 T1","Day Trading V4 T2","Day Trading V4 R/R","Day Trading V4 Trigger","Day Trading V4 Invalidation","Day Trading V4 Exit",
                 "Next Day Date","Next Day Outcome","Next Day Bias","Next Day Summary","Next Day ATR","Next Day ATR%","Next Day Up Trigger","Next Day Down Trigger","Next Day Pivot","Next Day Target",
                 "Short%","Options Strategy","Options Summary","Fundamental","CPR Text",
               ],
@@ -1624,10 +1906,17 @@ export default function ScannerPage() {
                   lreRangeText(r), lreFromEntry, r.lre_risk_pct, r.long_term_spring_text,
                   r.valuation_label, valuationFairValue(r), valuationUpsidePct(r), r.valuation_source, r.valuation_reason,
                   r.entry, r.stop_loss, r.target1, rewardPct(r.entry, r.target1), r.risk_pct, r.rr_t1, r.swing_invalidation_text, r.swing_spring_text,
+                  r.fib_target, r.fib_target_reward_pct != null ? `${r.fib_target_reward_pct.toFixed(2)}%` : "",
+                  r.fib_target_name, r.fib_target_source, r.fib_commentary,
+                  r.fib_prev_earnings, r.fib_last_earnings, r.fib_next_earnings,
+                  r.earn_zone, r.weekly_zone,
+                  r.near_fib_name && r.near_fib_price != null ? `${r.near_fib_name} ${r.near_fib_price}` : "",
+                  r.fib_compression ? "Y" : "",
                   r.news && r.news !== "No" ? `${r.news} (+${r.news_good ?? 0}/-${r.news_bad ?? 0} sum ${newsNet(r) >= 0 ? "+" : ""}${newsNet(r)})` : "",
                   r.next_earnings ?? "",
                   r.cpr_day_result, r.cpr_day_entry, r.cpr_day_stop, r.cpr_day_t1, rewardPct(r.cpr_day_entry, r.cpr_day_t1),
                   r.day_spring_text, r.cpr_day_trigger_text, r.cpr_day_invalidation_text, r.cpr_day_target_text, r.cpr_day_volume_text, r.cpr_day_15m_volume_text, r.cpr_day_ref,
+                  r.dt4_context, r.dt4_setup, r.dt4_side, r.dt4_grade, r.dt4_level, r.dt4_entry, r.dt4_stop, r.dt4_t1, r.dt4_t2, r.dt4_rr, r.dt4_trigger, r.dt4_invalidation, r.dt4_exit_plan,
                   r.next_day_date, r.next_day_outcome, r.next_day_bias, r.next_day_summary ?? r.next_day_prediction,
                   r.next_day_atr, r.next_day_atr_pct, r.next_day_trigger_up, r.next_day_trigger_down,
                   r.next_day_pivot, r.next_day_target,
@@ -1662,7 +1951,10 @@ export default function ScannerPage() {
                   <th className="text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-accent" title="Swing scans daily bars for spring action. A green sprout appears in rows when detected. Includes the per-ticker BTD badge (Buy-The-Dip: 20/50/200 EMA structure) — double-click it for full detail + copy. Pair with the market BTD/γ badge in the top bar.">
                     SWING <span className="text-green/60">{"\u{1F331}"}</span>
                   </th>
-                  <th className="text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-yellow" title="Day Trading scans 4H bars for spring action. A green sprout appears in rows when detected.">
+                  <th className="text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-green" title="Directional Fibonacci target from the last earnings swing when available, otherwise the 52-week swing. Separate from the risk-based Swing T1.">
+                    Fib Target
+                  </th>
+                  <th className="text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-yellow" title="Day Trading includes CPR triggers plus V4 PDH/PDL/PWH/PWL next-session plans. A green sprout appears in rows when detected.">
                     Day Trading <span className="text-green/60">{"\u{1F331}"}</span>
                   </th>
                   <th className="text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-muted" title="Prediction only. Use with caution and confirm with price action.">
@@ -1837,14 +2129,12 @@ export default function ScannerPage() {
                           📅 Seasonality 📊
                         </div>
                         </div>
-                        {r.lre_score && r.lre_score > 0 ? (
+                        {(r.lre_entry != null && r.lre_stop != null) ? (
                           <div className="flex flex-col items-center leading-tight gap-0.5">
-                            {r.lre_entry != null && r.lre_stop != null && (
-                              <div className="flex flex-col items-center gap-0.5 font-mono">
-                                <span className="text-[9px] text-muted">Entry Range</span>
-                                <span className="text-[10px] text-white">{lreRangeText(r)}</span>
-                              </div>
-                            )}
+                            <div className="flex flex-col items-center gap-0.5 font-mono">
+                              <span className="text-[9px] text-muted">Entry Range</span>
+                              <span className="text-[10px] text-white">{lreRangeText(r)}</span>
+                            </div>
                             {r.lre_entry != null && r.price != null && r.lre_entry > 0 && (() => {
                               const diffPct = ((r.price! - r.lre_entry!) / r.lre_entry!) * 100;
                               const stale = Math.abs(diffPct) > 5;
@@ -2043,6 +2333,43 @@ export default function ScannerPage() {
                               </>
                             )}
                           </div>
+                          {(r.prev_week_high != null || r.prev_month_high != null || r.wk52_high != null) && (
+                            <div
+                              className="grid grid-cols-[42px_96px] gap-x-1 gap-y-0.5 border-t border-border/20 pt-1 mt-1 text-[10px] font-mono"
+                              title="Multi-timeframe S/R for swing context — Prior Week / Prior Month / 52-week High & Low. Excludes today's bar."
+                            >
+                              {r.prev_week_high != null && (
+                                <>
+                                  <span className="text-muted">PWH/L</span>
+                                  <span className="text-right">
+                                    <span className="text-green/80">{fmtMoney(r.prev_week_high)}</span>
+                                    <span className="text-muted/50"> / </span>
+                                    <span className="text-red/80">{fmtMoney(r.prev_week_low)}</span>
+                                  </span>
+                                </>
+                              )}
+                              {r.prev_month_high != null && (
+                                <>
+                                  <span className="text-muted">PMH/L</span>
+                                  <span className="text-right">
+                                    <span className="text-green/80">{fmtMoney(r.prev_month_high)}</span>
+                                    <span className="text-muted/50"> / </span>
+                                    <span className="text-red/80">{fmtMoney(r.prev_month_low)}</span>
+                                  </span>
+                                </>
+                              )}
+                              {r.wk52_high != null && (
+                                <>
+                                  <span className="text-muted">52wH/L</span>
+                                  <span className="text-right">
+                                    <span className="text-green/80">{fmtMoney(r.wk52_high)}</span>
+                                    <span className="text-muted/50"> / </span>
+                                    <span className="text-red/80">{fmtMoney(r.wk52_low)}</span>
+                                  </span>
+                                </>
+                              )}
+                            </div>
+                          )}
                           {r.swing_invalidation_text && (
                             <div className="grid grid-cols-[34px_96px] gap-x-1 gap-y-0.5">
                               <span className="text-muted">Inv</span>
@@ -2098,7 +2425,86 @@ export default function ScannerPage() {
                       </td>
                       <td
                         className="px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30"
-                        title={[r.cpr_interpretation, r.day_spring_text, r.cpr_day_15m_volume_text, r.cpr_day_volume_text, r.cpr_day_ref].filter(Boolean).join(" | ") || undefined}
+                        title={[
+                          r.fib_commentary,
+                          r.fib_next_earnings ? `Next earnings ${r.fib_next_earnings}` : null,
+                          r.fib_last_earnings ? `Last earnings ${r.fib_last_earnings}` : null,
+                          r.fib_target_source,
+                          r.fib_earn_window ? `Earn window ${r.fib_earn_window}` : null,
+                          r.fib_swing_low != null && r.fib_swing_high != null ? `Swing ${fmtMoney(r.fib_swing_low)}-${fmtMoney(r.fib_swing_high)}` : null,
+                          r.fib_pos_pct != null ? `Swing pos ${r.fib_pos_pct}%` : null,
+                          r.weekly_pos_pct != null ? `Weekly pos ${r.weekly_pos_pct}%` : null,
+                        ].filter(Boolean).join(" | ") || undefined}
+                      >
+                        {r.fib_target != null || r.near_fib_name ? (
+                          <div className="flex flex-col gap-0.5 leading-tight font-mono">
+                            <div className="grid grid-cols-[38px_74px] gap-x-1 gap-y-0.5">
+                              <span className="text-muted">Tgt</span>
+                              <span className={`text-right ${r.direction === "SHORT" ? "text-red" : "text-green"}`}>
+                                {fmtMoney(r.fib_target)}
+                              </span>
+                              <span className="text-muted">Level</span>
+                              <span className="text-right text-white whitespace-normal">{r.fib_target_name ?? "-"}</span>
+                              <span className="text-muted">Reward</span>
+                              <span className="text-right text-green">
+                                {r.fib_target_reward_pct != null ? `${r.fib_target_reward_pct.toFixed(2)}%` : rewardPct(r.price, r.fib_target)}
+                              </span>
+                              <span className="text-muted">Near</span>
+                              <span className="text-right text-muted/80 whitespace-normal">
+                                {r.near_fib_name ? `${r.near_fib_name} ${fmtMoney(r.near_fib_price)}` : "-"}
+                              </span>
+                              {(r.fib_next_earnings || r.fib_last_earnings) && (
+                                <>
+                                  <span className="text-muted">Earn</span>
+                                  <span className="text-right text-muted/80 whitespace-normal">
+                                    {r.fib_next_earnings ? `Next ${r.fib_next_earnings}` : `Last ${r.fib_last_earnings}`}
+                                  </span>
+                                </>
+                              )}
+                            </div>
+                            {r.fib_commentary && (
+                              <div className="mt-1 max-w-[150px] whitespace-normal border-t border-border/30 pt-1 text-[9px] leading-snug text-muted/90">
+                                {r.fib_commentary}
+                              </div>
+                            )}
+                            <div className="mt-1 flex max-w-[130px] flex-wrap gap-1">
+                              {r.earn_zone && (
+                                <span className={`rounded border px-1 py-0.5 text-[9px] ${
+                                  r.earn_zone === "LOW" ? "border-green/30 bg-green/10 text-green" :
+                                  r.earn_zone === "HIGH" ? "border-red/30 bg-red/10 text-red" :
+                                                          "border-yellow/30 bg-yellow/10 text-yellow"
+                                }`}>
+                                  Earn {r.earn_zone}
+                                </span>
+                              )}
+                              {r.weekly_zone && (
+                                <span className={`rounded border px-1 py-0.5 text-[9px] ${
+                                  r.weekly_zone === "LOW" ? "border-green/30 bg-green/10 text-green" :
+                                  r.weekly_zone === "HIGH" ? "border-red/30 bg-red/10 text-red" :
+                                                            "border-yellow/30 bg-yellow/10 text-yellow"
+                                }`}>
+                                  Wk {r.weekly_zone}
+                                </span>
+                              )}
+                              {r.fib_compression && (
+                                <span className="rounded border border-accent/30 bg-accent/10 px-1 py-0.5 text-[9px] text-accent">
+                                  Comp
+                                </span>
+                              )}
+                              {r.fib_target_source && (
+                                <span className="rounded border border-border/50 px-1 py-0.5 text-[9px] text-muted">
+                                  {r.fib_target_source}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        ) : (
+                          <span className="text-muted/40 text-xs">-</span>
+                        )}
+                      </td>
+                      <td
+                        className="px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30"
+                        title={[r.cpr_interpretation, r.day_spring_text, r.dt4_note, r.dt4_exit_plan, r.cpr_day_15m_volume_text, r.cpr_day_volume_text, r.cpr_day_ref].filter(Boolean).join(" | ") || undefined}
                       >
                         {r.cpr_day_result ? (
                           <div className="flex flex-col gap-0.5 leading-tight font-mono">
@@ -2128,6 +2534,135 @@ export default function ScannerPage() {
                                   <span className="text-muted">15m</span><span className={`text-right whitespace-normal ${dayVolumeColor(r.cpr_day_15m_volume_text)}`}>{r.cpr_day_15m_volume_text ?? "15m pending"}</span>
                                 </div>
                               </div>
+                            )}
+                            {r.dt4_enabled !== false && r.dt4_setup && r.dt4_setup !== "disabled" && (
+                              <div
+                                className="mt-1 border-t border-border/30 pt-1"
+                                title={[
+                                  r.dt4_note,
+                                  r.dt4_setup === "range_wait"
+                                    ? `1. Long scenario: let price sweep below PDL ${fmtMoney(r.dt4_pdl)} or PWL ${fmtMoney(r.dt4_pwl)} first; then wait for a 5m close back above the swept level and a retest hold. 2. Short scenario: let price sweep above PDH ${fmtMoney(r.dt4_pdh)} or PWH ${fmtMoney(r.dt4_pwh)} first; then wait for a 5m close back below the swept level and a failed retest.`
+                                    : null,
+                                  r.dt4_exit_plan,
+                                  r.dt4_target_plan,
+                                ].filter(Boolean).join(" | ") || undefined}
+                              >
+                                <div className="grid grid-cols-[34px_96px] gap-x-1 gap-y-0.5">
+                                  <span className="text-yellow">V4</span>
+                                  <span className={`whitespace-normal ${
+                                    r.dt4_side === "long"  ? "text-green" :
+                                    r.dt4_side === "short" ? "text-red"   :
+                                                              "text-yellow"
+                                  }`}>
+                                    {r.dt4_context === "next_session" ? "Next: " : ""}
+                                    {(r.dt4_setup ?? "").replaceAll("_", " ")}
+                                    {r.dt4_grade ? ` · ${r.dt4_grade}` : ""}
+                                  </span>
+                                  <span className="text-muted">Bias</span>
+                                  <span className="text-right text-muted/80 whitespace-normal">{r.dt4_bias ?? "-"}</span>
+                                  <span className="text-muted">{r.dt4_setup === "range_wait" ? "Support" : "Lvl"}</span>
+                                  <span className="text-right text-accent whitespace-normal">
+                                    {r.dt4_setup === "range_wait"
+                                      ? `PDL ${fmtMoney(r.dt4_pdl)} / PWL ${fmtMoney(r.dt4_pwl)}`
+                                      : `${r.dt4_level ?? "PDH/PDL"} ${fmtMoney(r.dt4_level_val)}`}
+                                  </span>
+                                  <span className="text-muted">{r.dt4_setup === "range_wait" ? "Resist" : "Watch"}</span>
+                                  <span className="text-right text-accent whitespace-normal">
+                                    {r.dt4_setup === "range_wait"
+                                      ? `PDH ${fmtMoney(r.dt4_pdh)} / PWH ${fmtMoney(r.dt4_pwh)}`
+                                      : fmtMoney(r.dt4_entry)}
+                                  </span>
+                                  <span className="text-muted">{r.dt4_setup === "range_wait" ? "Entry" : "Stop"}</span>
+                                  <span className={`text-right whitespace-normal ${r.dt4_setup === "range_wait" ? "text-accent" : "text-red"}`}>
+                                    {r.dt4_setup === "range_wait" ? "wait for reclaim/reject" : fmtMoney(r.dt4_stop)}
+                                  </span>
+                                  <span className="text-muted">{r.dt4_setup === "range_wait" ? "Risk" : "T1"}</span>
+                                  <span className="text-right text-green whitespace-normal">
+                                    {r.dt4_setup === "range_wait" ? "after trigger" : fmtMoney(r.dt4_t1)}
+                                  </span>
+                                  {r.dt4_t2 != null && (
+                                    <>
+                                      <span className="text-muted">T2</span>
+                                      <span className="text-right text-green/70">{fmtMoney(r.dt4_t2)}</span>
+                                    </>
+                                  )}
+                                  <span className="text-muted">{r.dt4_setup === "range_wait" ? "Tgt" : "R:R"}</span>
+                                  {r.dt4_setup === "range_wait" && (
+                                    <span className="text-right text-accent whitespace-normal">VWAP/mid, then opposite edge</span>
+                                  )}
+                                  {r.dt4_setup !== "range_wait" && (
+                                  <span className="text-right text-accent">{r.dt4_rr != null ? `${r.dt4_rr}×` : "-"}</span>
+                                  )}
+                                  <span className="text-muted">Trig</span>
+                                  <span className="text-right text-accent whitespace-normal">{r.dt4_trigger ?? "-"}</span>
+                                  <span className="text-muted">Inv</span>
+                                  <span className="text-right text-red whitespace-normal">{r.dt4_invalidation ?? "-"}</span>
+                                </div>
+                              </div>
+                            )}
+                            {r.dt3_setup && (
+                              (r.dt3_setup === "no_setup" || r.dt3_setup === "error") ? (
+                                // Heartbeat: v3 ran but found nothing, or
+                                // errored. Either way, surface a visible
+                                // line so the column never silently
+                                // disappears — and show the levels v3 is
+                                // watching when available.
+                                <div
+                                  className="mt-1 border-t border-border/30 pt-1 text-[10px] font-mono whitespace-normal"
+                                  title={r.dt3_rationale ?? (r.dt3_setup === "error" ? "V3 errored — see backend logs." : "V3 engine running — no qualifying setup at this bar.")}
+                                >
+                                  <span className={r.dt3_setup === "error" ? "text-red/70" : "text-accent/60"}>V3</span>
+                                  <span className={r.dt3_setup === "error" ? "text-red/80" : "text-muted/70"}>
+                                    {r.dt3_setup === "error" ? " · errored" : " · waiting"}
+                                  </span>
+                                  {(r.dt3_pwh != null || r.dt3_pwl != null) && (
+                                    <div className="text-muted/50 leading-tight">
+                                      watching PWH {fmtMoney(r.dt3_pwh)} / PWL {fmtMoney(r.dt3_pwl)}
+                                    </div>
+                                  )}
+                                  {(r.dt3_pdh != null || r.dt3_pdl != null) && (
+                                    <div className="text-muted/40 leading-tight">
+                                      PDH {fmtMoney(r.dt3_pdh)} / PDL {fmtMoney(r.dt3_pdl)}
+                                    </div>
+                                  )}
+                                </div>
+                              ) : (
+                                <div
+                                  className="mt-1 border-t border-border/30 pt-1"
+                                  title={r.dt3_rationale ?? undefined}
+                                >
+                                  <div className="grid grid-cols-[34px_96px] gap-x-1 gap-y-0.5">
+                                    <span className="text-accent">V3</span>
+                                    <span className={`whitespace-normal ${
+                                      r.dt3_side === "long"  ? "text-green" :
+                                      r.dt3_side === "short" ? "text-red"   :
+                                                                "text-accent"
+                                    }`}>
+                                      {(r.dt3_setup ?? "").replace("_", "+")}
+                                      {r.dt3_side ? ` · ${r.dt3_side}` : ""}
+                                      {r.dt3_grade ? ` · ${r.dt3_grade}` : ""}
+                                    </span>
+                                    <span className="text-muted">Lvl</span>
+                                    <span className="text-right text-accent whitespace-normal">
+                                      {r.dt3_level ?? "—"} {fmtMoney(r.dt3_level_val)}
+                                    </span>
+                                    <span className="text-muted">Entry</span>
+                                    <span className="text-right text-accent">{fmtMoney(r.dt3_entry)}</span>
+                                    <span className="text-muted">Stop</span>
+                                    <span className="text-right text-red">{fmtMoney(r.dt3_stop)}</span>
+                                    <span className="text-muted">T1</span>
+                                    <span className="text-right text-green">{fmtMoney(r.dt3_t1)}</span>
+                                    {r.dt3_t2 != null && (
+                                      <>
+                                        <span className="text-muted">T2</span>
+                                        <span className="text-right text-green/70">{fmtMoney(r.dt3_t2)}</span>
+                                      </>
+                                    )}
+                                    <span className="text-muted">R:R</span>
+                                    <span className="text-right text-accent">{r.dt3_rr != null ? `${r.dt3_rr}×` : "—"}</span>
+                                  </div>
+                                </div>
+                              )
                             )}
                           </div>
                         ) : <span className="text-muted/40">—</span>}

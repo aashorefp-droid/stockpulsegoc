@@ -84,6 +84,8 @@ def _fetch_finviz_news(ticker: str) -> list[dict]:
             if not a_tag:
                 continue
             headline = a_tag.text.strip()
+            if not headline:
+                continue  # Finviz occasionally returns empty-text anchors
             # Source is sometimes in a small span after the link
             source = ""
             for span in row.find_all("span"):

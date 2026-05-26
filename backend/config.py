@@ -24,7 +24,11 @@ def _load_env_file(path: str) -> int:
                 k, _, v = line.partition("=")
                 k = k.strip()
                 v = v.strip().strip('"').strip("'")
-                if k and k not in os.environ:
+                # Skip empty values — a placeholder line like `KEY=` would
+                # otherwise pollute os.environ and shadow a real value coming
+                # from a different layer (e.g. streamlit/config.py's
+                # os.getenv defaults). Only non-empty values are loaded.
+                if k and v and k not in os.environ:
                     os.environ[k] = v
                     n += 1
     except Exception:
@@ -42,12 +46,38 @@ for _p in (
         _load_env_file(_p)
         break  # first one wins
 
+
+# ── Local-dev fallback: streamlit/config.py ─────────────────────────────────
+# If the user keeps live keys in the streamlit-root config.py (gitignored),
+# import it once and use those values when an env var isn't otherwise set.
+# Production (Render) has env vars set and this file isn't present, so the
+# import quietly fails and _req() still reports `missing`.
+_legacy_cfg = None
+_legacy_cfg_path = os.path.normpath(os.path.join(_here, "..", "..", "config.py"))
+if os.path.exists(_legacy_cfg_path):
+    try:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("_stockpulse_legacy_cfg",
+                                              _legacy_cfg_path)
+        _legacy_cfg = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_legacy_cfg)  # type: ignore[union-attr]
+        logger.info("config: loaded local-dev fallback from %s",
+                    _legacy_cfg_path)
+    except Exception as _e:
+        logger.warning("config: legacy config.py present but failed to "
+                       "import (%s) — env-only mode", _e)
+        _legacy_cfg = None
+
+
 _missing: list[str] = []
 
 
 def _req(name: str) -> str:
-    """Required secret — env only. Records (doesn't raise) when unset."""
+    """Required secret — env first, then streamlit/config.py fallback for
+    local dev. Records (doesn't raise) when unset everywhere."""
     v = os.getenv(name, "").strip()
+    if not v and _legacy_cfg is not None:
+        v = str(getattr(_legacy_cfg, name, "") or "").strip()
     if not v:
         _missing.append(name)
     return v

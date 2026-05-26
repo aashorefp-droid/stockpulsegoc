@@ -49,6 +49,23 @@ except ImportError:
 scheduler = AsyncIOScheduler(timezone="America/Chicago")
 
 
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+_SCANNER_SNAPSHOT_ENABLED = _env_enabled(
+    "SCANNER_SNAPSHOT_ENABLED",
+    os.getenv("MOMENTUM_SNAPSHOT_ENABLED", "1"),
+)
+_SWEEP_DIGEST_ENABLED = _env_enabled("SWEEP_DIGEST_ENABLED", "1")
+# Earnings jobs — pre-earnings discovery (8:30 CST) + EPS polling
+# (15:00–18:00 CST). Default OFF; set EARNINGS_JOBS_ENABLED=1 to re-enable.
+_EARNINGS_JOBS_ENABLED = _env_enabled("EARNINGS_JOBS_ENABLED", "0")
+# Regime-change Telegram alerts (verdict + γ flips). Default ON; set
+# MACRO_ALERTS_ENABLED=0 to silence.
+_MACRO_ALERTS_ENABLED  = _env_enabled("MACRO_ALERTS_ENABLED", "1")
+
+
 # ── Message formatters ────────────────────────────────────────────────────────
 
 def _fmt_pre(ticker: str, analysis: dict) -> str:
@@ -423,52 +440,244 @@ def momentum_scan_job():
     logger.info(f"[scheduler] momentum scan sent: {len(results)} signals")
 
 
-def news_summary_job():
-    """8:00 AM CST — scan every watchlist, Telegram a Good/Bad news digest."""
-    from backend.services.scanner import (
-        scan_single, WATCHLISTS, get_telegram_watchlist, ETF_SECTORS,
-    )
+def scanner_snapshot_job():
+    """After market close: refresh saved scanner snapshots in Neon/Postgres."""
+    if not _SCANNER_SNAPSHOT_ENABLED:
+        logger.info("[scheduler] scanner snapshots skipped: SCANNER_SNAPSHOT_ENABLED=0")
+        return
+    try:
+        from backend.services.scanner_snapshot import (
+            configured_watchlists,
+            prune_snapshots,
+            refresh_snapshots,
+        )
+
+        watchlists = configured_watchlists()
+        snaps = refresh_snapshots(watchlists)
+        pruned = prune_snapshots(watchlists=watchlists)
+        summary = ", ".join(
+            f"{s.get('watchlist')}={s.get('count', 0)}"
+            for s in snaps.get("watchlists", [])
+        )
+        logger.info(
+            "[scheduler] scanner snapshots refreshed: %s for %s via %s; pruned=%s",
+            summary,
+            snaps.get("date"),
+            snaps.get("store"),
+            pruned.get("deleted"),
+        )
+    except Exception as e:
+        logger.error(f"[scheduler] scanner snapshot refresh failed: {e}")
+
+
+def momentum_snapshot_job():
+    """Backward-compatible entrypoint for the old Momentum-only scheduler."""
+    scanner_snapshot_job()
+
+
+def sweep_digest_job():
+    """Post-market: send V4/V3 sweep reclaim/reject setups from saved scans."""
+    if not _SWEEP_DIGEST_ENABLED:
+        logger.info("[scheduler] sweep digest skipped: SWEEP_DIGEST_ENABLED=0")
+        return
+
+    import html
+
+    try:
+        from backend.services.scanner_snapshot import (
+            configured_watchlists,
+            load_snapshot,
+            refresh_snapshots,
+        )
+
+        watchlists = configured_watchlists()
+        snapshots = [load_snapshot(w) for w in watchlists]
+        if not any(s.get("available") and s.get("results") for s in snapshots):
+            refreshed = refresh_snapshots(watchlists)
+            snapshots = refreshed.get("watchlists", [])
+
+        seen: set[str] = set()
+        longs: list[dict] = []
+        shorts: list[dict] = []
+
+        for snap in snapshots:
+            for row in snap.get("results") or []:
+                ticker = str(row.get("ticker") or "").upper()
+                if not ticker or ticker in seen or row.get("error"):
+                    continue
+                seen.add(ticker)
+
+                dt4_setup = row.get("dt4_setup")
+                dt3_setup = row.get("dt3_setup")
+                dt3_side = row.get("dt3_side")
+
+                is_long = dt4_setup == "sweep_reclaim_long" or (
+                    dt3_setup == "sweep_reclaim" and dt3_side == "long"
+                )
+                is_short = dt4_setup == "sweep_reject_short" or (
+                    dt3_setup == "sweep_reclaim" and dt3_side == "short"
+                )
+                if not is_long and not is_short:
+                    continue
+
+                rec = {
+                    "ticker": ticker,
+                    "price": row.get("price"),
+                    "sector": row.get("sector"),
+                    "verdict": row.get("verdict"),
+                    "setup": dt4_setup or dt3_setup,
+                    "grade": row.get("dt4_grade") or row.get("dt3_grade"),
+                    "level": row.get("dt4_level") or row.get("dt3_level"),
+                    "entry": row.get("dt4_entry") or row.get("dt3_entry"),
+                    "stop": row.get("dt4_stop") or row.get("dt3_stop"),
+                    "t1": row.get("dt4_t1") or row.get("dt3_t1"),
+                    "rr": row.get("dt4_rr") or row.get("dt3_rr"),
+                    "trigger": row.get("dt4_trigger") or row.get("dt3_rationale"),
+                }
+                (longs if is_long else shorts).append(rec)
+
+        def _money(value) -> str:
+            return f"${value:.2f}" if isinstance(value, (int, float)) else "-"
+
+        def _line(row: dict) -> str:
+            parts = [
+                f"<b>{html.escape(row['ticker'])}</b>",
+                _money(row.get("price")),
+                html.escape(str(row.get("grade") or "")),
+                html.escape(str(row.get("level") or "")),
+            ]
+            head = " ".join(p for p in parts if p and p != "-")
+            setup = html.escape(str(row.get("setup") or "").replace("_", " "))
+            risk = (
+                f"watch {_money(row.get('entry'))} / stop {_money(row.get('stop'))} / "
+                f"T1 {_money(row.get('t1'))}"
+            )
+            rr = row.get("rr")
+            if isinstance(rr, (int, float)):
+                risk += f" / R:R {rr:.2f}x"
+            trigger = html.escape(str(row.get("trigger") or ""))[:180]
+            return f"{head}\n   {setup} - {risk}\n   {trigger}"
+
+        def _block(title: str, rows: list[dict]) -> str:
+            if not rows:
+                return f"<b>{title} (0)</b>\n-"
+            rows.sort(key=lambda r: (-(r.get("rr") or 0), str(r.get("ticker") or "")))
+            return f"<b>{title} ({len(rows)})</b>\n" + "\n\n".join(_line(r) for r in rows[:12])
+
+        msg = (
+            f"🎯 <b>Post-Market Sweep Setups - {today_str()}</b>\n"
+            f"Watchlists: {html.escape(', '.join(watchlists))}\n\n"
+            f"{_block('Sweep Reclaim Long', longs)}\n\n"
+            f"{_block('Sweep Reclaim Short', shorts)}"
+        )
+        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+        logger.info(
+            "[scheduler] sweep digest sent: %s long / %s short from %s tickers",
+            len(longs),
+            len(shorts),
+            len(seen),
+        )
+    except Exception as e:
+        logger.error(f"[scheduler] sweep digest failed: {e}")
+
+
+#: Watchlists scanned by the 8:00 AM CST news digest. Restricted to these
+#: named lists only — short_squeeze and the dynamic TOS/Gmail list are
+#: intentionally excluded to keep the digest focused and the scan cheap.
+#: Counts (as of scanner.WATCHLISTS): default 50, tech 30, mega_cap 20,
+#: momentum 20, etfs 56 — ~176 entries pre-dedupe, ~120 after dedupe.
+NEWS_SCAN_LISTS: tuple[str, ...] = (
+    "default", "tech", "mega_cap", "momentum", "etfs",
+)
+
+
+def news_summary_job(title: str = "News Digest"):
+    """8:00 AM CST — scan a fixed set of watchlists (default/tech/mega_cap/
+    momentum/etfs) and Telegram a Good/Bad news digest."""
+    from backend.services.scanner import scan_single, WATCHLISTS, ETF_SECTORS
+    from backend.services.news_sentiment import get_news_details
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # Known ETF universe: explicit ETF watchlist + sector/index ETF map.
     etf_set = set(WATCHLISTS.get("etfs", [])) | set(ETF_SECTORS.keys())
 
-    # Union of every static watchlist + the TOS/Gmail watchlist, deduped.
+    # Union of the configured watchlists only, deduped (preserves order).
     tickers: list[str] = []
     seen: set = set()
-    for lst in list(WATCHLISTS.values()) + [get_telegram_watchlist()]:
+    list_counts: list[str] = []
+    for key in NEWS_SCAN_LISTS:
+        lst = WATCHLISTS.get(key, [])
+        added = 0
         for t in lst:
             if t not in seen:
                 seen.add(t)
                 tickers.append(t)
+                added += 1
+        list_counts.append(f"{key}={len(lst)}(+{added} new)")
 
-    logger.info(f"[scheduler] news summary: scanning {len(tickers)} unique tickers")
+    logger.info(
+        f"[scheduler] news summary: scanning {len(tickers)} unique tickers "
+        f"from {len(NEWS_SCAN_LISTS)} lists [{', '.join(list_counts)}]"
+    )
 
     import html
+
+    def _scan_with_news(ticker: str) -> dict:
+        try:
+            row = scan_single(ticker)
+        except Exception as exc:
+            logger.debug(f"[scheduler] scanner row failed for {ticker}: {exc}")
+            row = {"ticker": ticker}
+        row.setdefault("ticker", ticker)
+        if row.get("news") not in ("Good", "Bad"):
+            try:
+                details = get_news_details(ticker)
+                row["news"] = details.get("label", "No")
+                row["news_good"] = details.get("good_score", 0) or 0
+                row["news_bad"] = details.get("bad_score", 0) or 0
+                row["news_headlines"] = details.get("headlines") or []
+            except Exception as exc:
+                logger.debug(f"[scheduler] news lookup failed for {ticker}: {exc}")
+                row["news"] = "No"
+        row["_news_checked"] = True
+        return row
 
     good: list[dict] = []
     bad:  list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(scan_single, t): t for t in tickers}
+        futures = {pool.submit(_scan_with_news, t): t for t in tickers}
         for fut in as_completed(futures):
             try:
                 r = fut.result()
             except Exception:
                 continue
-            if r.get("error"):
+            if r.get("error") and r.get("news") not in ("Good", "Bad"):
                 continue
             label = r.get("news")
-            if label not in ("Good", "Bad"):
-                continue
             g = r.get("news_good", 0) or 0
             b = r.get("news_bad", 0) or 0
+            headlines = r.get("news_headlines") or []
+
+            if label not in ("Good", "Bad") and not r.get("_news_checked"):
+                try:
+                    details = get_news_details(t)
+                    label = details.get("label", "No")
+                    g = details.get("good_score", 0) or 0
+                    b = details.get("bad_score", 0) or 0
+                    headlines = details.get("headlines") or []
+                except Exception as exc:
+                    logger.debug(f"[scheduler] news lookup failed for {t}: {exc}")
+                    label = "No"
+
+            if label not in ("Good", "Bad"):
+                continue
             rec = {
                 "ticker":  r["ticker"],
                 "price":   r.get("price"),
                 "verdict": r.get("verdict", "—"),
                 "g": g, "b": b, "net": g - b,
                 "is_etf":  r["ticker"].upper() in etf_set,
-                "headlines": r.get("news_headlines") or [],
+                "headlines": headlines,
             }
             (good if label == "Good" else bad).append(rec)
 
@@ -488,10 +697,15 @@ def news_summary_job():
                 f"+{x['g']}/-{x['b']} (Σ{'+' if net >= 0 else ''}{net})"
             )
             hls = []
-            for hd in x["headlines"][:3]:
-                ic = "🟢" if hd.get("s") == "Good" else "🔴" if hd.get("s") == "Bad" else "⚪"
+            for hd in x["headlines"][:6]:    # over-fetch — we filter empties
+                text = (hd.get("h") or "").strip()
+                if not text:
+                    continue              # never render a bare bubble
+                ic  = "🟢" if hd.get("s") == "Good" else "🔴" if hd.get("s") == "Bad" else "⚪"
                 src = f" — {html.escape(hd['src'])}" if hd.get("src") else ""
-                hls.append(f"   {ic} {html.escape(hd.get('h', ''))}{src}")
+                hls.append(f"   {ic} {html.escape(text)}{src}")
+                if len(hls) >= 3:
+                    break
             blocks.append(head + ("\n" + "\n".join(hls) if hls else ""))
         return "\n\n".join(blocks)
 
@@ -510,11 +724,26 @@ def news_summary_job():
         f"🔴 <b>Bad — Stocks ({len(b_stk)})</b>\n{_detail(b_stk)}\n\n"
         f"🔴 <b>Bad — ETFs ({len(b_etf)})</b>\n{_detail(b_etf)}"
     )
+    if title != "News Digest":
+        msg = msg.replace("<b>News Digest", f"<b>{html.escape(title)}", 1)
     send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+    # Diagnostic: count non-empty headlines actually rendered so we can spot
+    # the "white bubbles, no text" regression at a glance.
+    _hl_total = sum(
+        1
+        for rec in (good + bad)
+        for hd in rec.get("headlines", [])[:6]
+        if (hd.get("h") or "").strip()
+    )
     logger.info(
         f"[scheduler] news summary sent: {len(good)} good / {len(bad)} bad "
-        f"(top 3 each with details)"
+        f"(top 3 each with details) — {_hl_total} headline lines rendered"
     )
+
+
+def post_market_news_summary_job():
+    """After market close: send the Good/Bad news digest again."""
+    news_summary_job("Post-Market News Digest")
 
 
 def telegram_watchlist_job():
@@ -584,6 +813,265 @@ def stop_eps_polling():
         logger.info("[scheduler] EPS polling stopped")
 
 
+# ── Macro regime watcher ────────────────────────────────────────────────────
+# Mirrors MarketRisk.tsx dayVerdict() so the alert text reflects exactly what
+# the user sees in the UI. Two separate transitions are tracked:
+#   - "verdict": Day to Buy / Wait for pullback / Sideline / Day to Sell
+#   - "gamma":   γ Long Gamma / Short Gamma / Near Flip
+# Persisted to chatgpt/backend/db/macro_state.json (gitignored). A 5-min
+# inter-alert cooldown absorbs Near-Flip whipsaw on the boundaries.
+
+_MACRO_STATE_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "db", "macro_state.json",
+)
+_MACRO_ALERT_COOLDOWN_SEC = 300  # 5 min between alerts of any kind
+
+
+def _compute_day_verdict(gex_regime, btd_state, btd_zone, risk_score):
+    """Return (label, reason). Exact mirror of MarketRisk.tsx dayVerdict()."""
+    # Sell triggers — any single warning sign wins
+    sell_reasons: list[str] = []
+    if gex_regime in ("Short Gamma", "Near Flip"):
+        sell_reasons.append(f"γ {gex_regime}")
+    if btd_state == "DISARMED":
+        sell_reasons.append("BTD DISARMED")
+    if (risk_score or 0) >= 3:
+        sell_reasons.append(f"Risk {risk_score} (HIGH)")
+    if sell_reasons:
+        return "Day to Sell", "Sell bias — " + " · ".join(sell_reasons)
+
+    pullback_or_trigger = (
+        btd_state == "TRIGGER"
+        or (btd_state == "ARMED"      and btd_zone == "dip 20–50EMA")
+        or (btd_state == "ARMED-DEEP" and btd_zone == "deep dip <50EMA")
+    )
+    is_extended = btd_state == "ARMED" and btd_zone == "extended >20EMA"
+
+    if gex_regime == "Long Gamma" and pullback_or_trigger and (risk_score or 0) <= 2:
+        suffix = " · half size — deeper risk" if btd_state == "ARMED-DEEP" else ""
+        return "Day to Buy", (
+            f"Buy bias — γ Long Gamma · BTD {btd_state}/{btd_zone or '?'} "
+            f"· Risk {risk_score}/MOD or better{suffix}"
+        )
+    if gex_regime == "Long Gamma" and is_extended and (risk_score or 0) <= 2:
+        return "Wait for pullback", (
+            f"Environment OK (γ Long Gamma · Risk {risk_score}) but BTD ARMED "
+            "· extended >20EMA — no entry trigger. Wait for price to pull "
+            "back to 20EMA."
+        )
+    return "Sideline", (
+        f"Mixed — γ:{gex_regime or '?'} · BTD:{btd_state or '?'} "
+        f"· Risk:{risk_score}"
+    )
+
+
+def _load_macro_state() -> dict:
+    try:
+        if os.path.exists(_MACRO_STATE_PATH):
+            import json
+            with open(_MACRO_STATE_PATH, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+    except Exception as e:
+        logger.warning(f"[macro_watch] state read failed: {e}")
+    return {}
+
+
+def _save_macro_state(state: dict) -> None:
+    try:
+        import json
+        os.makedirs(os.path.dirname(_MACRO_STATE_PATH), exist_ok=True)
+        with open(_MACRO_STATE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+    except Exception as e:
+        logger.warning(f"[macro_watch] state write failed: {e}")
+
+
+def _verdict_emoji(label: str) -> str:
+    return {
+        "Day to Buy": "📈",
+        "Wait for pullback": "⏳",
+        "Sideline": "⏸",
+        "Day to Sell": "📉",
+    }.get(label, "📊")
+
+
+def macro_regime_watch_job():
+    """Poll the macro snapshot every 5 min during market hours; Telegram on
+    verdict transitions and γ regime flips. State persisted across restarts."""
+    if not _MACRO_ALERTS_ENABLED:
+        return
+    import html
+    from datetime import datetime, timezone
+
+    try:
+        from backend.routers.macro import macro_snapshot
+        snap = macro_snapshot()
+    except Exception as e:
+        logger.warning(f"[macro_watch] snapshot failed: {e}")
+        return
+
+    gex   = snap.get("gex") or {}
+    btd   = snap.get("btd") or {}
+    risk  = snap.get("risk") or {}
+    gex_avail   = gex.get("available") is True
+    gex_regime  = gex.get("regime") if gex_avail else None
+    btd_state   = btd.get("btd_state")
+    btd_zone    = btd.get("btd_zone")
+    risk_score  = int(risk.get("score") or 0)
+    risk_label  = risk.get("label") or "?"
+    verdict, reason = _compute_day_verdict(
+        gex_regime, btd_state, btd_zone, risk_score
+    )
+
+    state = _load_macro_state()
+    prev_verdict = state.get("verdict")
+    prev_gamma   = state.get("gex_regime")
+    now_iso      = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    # Detect transitions
+    transitions: list[tuple[str, str, str]] = []
+    if prev_verdict and verdict != prev_verdict:
+        transitions.append(("Verdict", prev_verdict, verdict))
+    if prev_gamma and gex_regime and gex_regime != prev_gamma:
+        transitions.append(("γ regime", prev_gamma, gex_regime))
+
+    if not transitions:
+        # First run — seed state without alerting
+        if not prev_verdict:
+            state.update(
+                verdict=verdict, gex_regime=gex_regime,
+                btd_state=btd_state, btd_zone=btd_zone,
+                risk_score=risk_score, last_changed_at=now_iso,
+            )
+            _save_macro_state(state)
+        return
+
+    # Cooldown — avoid whipsaw storms on Near-Flip boundaries
+    last_alert_iso = state.get("last_alerted_at")
+    if last_alert_iso:
+        try:
+            last = datetime.fromisoformat(last_alert_iso)
+            age_s = (datetime.now(timezone.utc) - last).total_seconds()
+            if age_s < _MACRO_ALERT_COOLDOWN_SEC:
+                logger.info(
+                    f"[macro_watch] transition detected but within "
+                    f"{int(age_s)}s cooldown — suppressing"
+                )
+                # Still persist new state so the next outside-cooldown change
+                # is detected against a fresh baseline.
+                state.update(
+                    verdict=verdict, gex_regime=gex_regime,
+                    btd_state=btd_state, btd_zone=btd_zone,
+                    risk_score=risk_score, last_changed_at=now_iso,
+                )
+                _save_macro_state(state)
+                return
+        except Exception:
+            pass
+
+    # Build alert
+    spy_chg_1d = ""
+    vix_now    = ""
+    for it in snap.get("items", []):
+        if it.get("ticker") == "SPY":
+            spy_chg_1d = f"SPY {it.get('chg_1d', 0):+.1f}% 1d · 5d {it.get('chg_5d', 0):+.1f}%"
+        elif it.get("ticker") == "^VIX":
+            vix_now = f"VIX {it.get('price', 0):.1f} ({it.get('chg_1d', 0):+.1f}% 1d)"
+
+    e_prev = _verdict_emoji(prev_verdict or "")
+    e_curr = _verdict_emoji(verdict)
+    lines = [f"<b>🚨 MARKET REGIME CHANGE</b>"]
+    for kind, before, after in transitions:
+        lines.append(
+            f"<b>{html.escape(kind)}:</b> {html.escape(before)} → "
+            f"<b>{html.escape(after)}</b>"
+        )
+    lines.append("")
+    lines.append(f"{e_curr} <b>{html.escape(verdict)}</b>")
+    lines.append(f"<i>{html.escape(reason)}</i>")
+    if spy_chg_1d or vix_now:
+        ctx = " · ".join(x for x in (spy_chg_1d, vix_now, risk_label) if x)
+        lines.append(f"\n{html.escape(ctx)}")
+    msg = "\n".join(lines)
+
+    try:
+        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+        logger.info(
+            f"[macro_watch] alerted: {prev_verdict} → {verdict} "
+            f"(γ {prev_gamma} → {gex_regime})"
+        )
+    except Exception as e:
+        logger.warning(f"[macro_watch] telegram send failed: {e}")
+
+    state.update(
+        verdict=verdict, gex_regime=gex_regime,
+        btd_state=btd_state, btd_zone=btd_zone,
+        risk_score=risk_score,
+        last_changed_at=now_iso, last_alerted_at=now_iso,
+    )
+    _save_macro_state(state)
+
+
+def momentum_refresh_job():
+    """Sunday 18:00 CST — re-screen the momentum universe and persist the
+    top 20 to momentum_watchlist.json. Telegram a diff vs last week so the
+    rotation is visible at a glance. WATCHLISTS["momentum"] auto-uses the
+    new file (mtime-cached) on the next scan."""
+    import html
+    try:
+        from backend.services.momentum_screener import (
+            pick_momentum_top_n, save_momentum_list, load_momentum_list,
+        )
+        prev = load_momentum_list() or {}
+        prev_set = set(prev.get("tickers") or [])
+
+        result = pick_momentum_top_n(n=20)
+        new_list = list(result.get("tickers") or [])
+        new_set = set(new_list)
+        if not new_set:
+            err = result.get("error", "no candidates passed filters")
+            logger.warning(f"[scheduler] momentum_refresh empty — {err}; keeping previous list")
+            send_telegram(
+                TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+                f"⚠️ Momentum refresh returned empty ({html.escape(str(err))}) — keeping previous list.",
+            )
+            return
+
+        save_momentum_list(result)
+        added   = sorted(new_set - prev_set)
+        dropped = sorted(prev_set - new_set)
+        scores  = result.get("scores", {})
+        top5    = new_list[:5]
+        top5_line = " · ".join(
+            f"<b>{html.escape(t)}</b> +{scores.get(t, 0):.0f}%" for t in top5
+        )
+        msg = (
+            f"📈 <b>Momentum list refreshed — {today_str()}</b>\n"
+            f"<i>{result.get('passed_filters', '?')} of "
+            f"{result.get('universe_size', '?')} candidates passed filters · "
+            f"ranked by {result['criteria'].get('lookback_days', 63)}d return</i>\n"
+            f"\nTop 5: {top5_line}\n"
+        )
+        if prev_set:   # only show diff if we have a previous run to compare
+            msg += (
+                f"\n<b>Added:</b>   {', '.join(html.escape(t) for t in added)   or '—'}"
+                f"\n<b>Dropped:</b> {', '.join(html.escape(t) for t in dropped) or '—'}"
+            )
+        msg += f"\n\n<b>Full list:</b> {', '.join(html.escape(t) for t in new_list)}"
+        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+        logger.info(
+            f"[scheduler] momentum_refresh: wrote {len(new_set)} tickers "
+            f"(+{len(added)} -{len(dropped)})"
+        )
+    except Exception as e:
+        logger.error(f"[scheduler] momentum_refresh failed: {e}")
+        try:
+            send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+                          f"❌ Momentum refresh failed: {type(e).__name__}: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
 # ── Scheduler setup ───────────────────────────────────────────────────────────
 
 def setup_scheduler():
@@ -594,13 +1082,14 @@ def setup_scheduler():
     init_db()
     init_watchlist()  # creates watchlist table if not exists
 
-    scheduler.add_job(
-        pre_earnings_job,
-        CronTrigger(hour=8, minute=30, timezone=CST),
-        id="pre_earnings",
-        replace_existing=True,
-        misfire_grace_time=300,
-    )
+    if _EARNINGS_JOBS_ENABLED:
+        scheduler.add_job(
+            pre_earnings_job,
+            CronTrigger(hour=8, minute=30, timezone=CST),
+            id="pre_earnings",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
 
     scheduler.add_job(
         news_summary_job,
@@ -608,6 +1097,14 @@ def setup_scheduler():
         id="news_summary",
         replace_existing=True,
         misfire_grace_time=600,
+    )
+
+    scheduler.add_job(
+        post_market_news_summary_job,
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=35, timezone=CST),
+        id="news_summary_post_market",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     scheduler.add_job(
@@ -619,18 +1116,58 @@ def setup_scheduler():
     )
 
     scheduler.add_job(
-        start_eps_polling,
-        CronTrigger(hour=15, minute=0, timezone=CST),
-        id="start_polling",
+        scanner_snapshot_job,
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=25, timezone=CST),
+        id="scanner_snapshots_close",
         replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     scheduler.add_job(
-        stop_eps_polling,
-        CronTrigger(hour=18, minute=0, timezone=CST),
-        id="stop_polling",
+        sweep_digest_job,
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=40, timezone=CST),
+        id="sweep_digest_close",
         replace_existing=True,
+        misfire_grace_time=3600,
     )
+
+    # Sunday 6 PM CST — re-screen the momentum universe and persist top 20.
+    # Misfire grace 6h so a Sunday-evening service restart still gets it.
+    scheduler.add_job(
+        momentum_refresh_job,
+        CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=CST),
+        id="momentum_refresh",
+        replace_existing=True,
+        misfire_grace_time=21600,
+    )
+
+    # Every 5 min Mon–Fri 08:00–15:55 CST — watch for verdict / γ regime
+    # transitions and Telegram on change. Snapshot is 5-min-cached so this
+    # is essentially free; no extra yfinance load.
+    if _MACRO_ALERTS_ENABLED:
+        scheduler.add_job(
+            macro_regime_watch_job,
+            CronTrigger(day_of_week="mon-fri",
+                        hour="8-15", minute="*/5", timezone=CST),
+            id="macro_regime_watch",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+
+    if _EARNINGS_JOBS_ENABLED:
+        scheduler.add_job(
+            start_eps_polling,
+            CronTrigger(hour=15, minute=0, timezone=CST),
+            id="start_polling",
+            replace_existing=True,
+        )
+
+        scheduler.add_job(
+            stop_eps_polling,
+            CronTrigger(hour=18, minute=0, timezone=CST),
+            id="stop_polling",
+            replace_existing=True,
+        )
 
     scheduler.add_job(
         telegram_watchlist_job,
@@ -680,8 +1217,15 @@ def setup_scheduler():
     except Exception as e:
         logger.warning(f"[scheduler] startup TOS/Gmail prime failed: {e}")
 
+    _macro_w = "macro_regime_watch every 5m Mon-Fri 8-15:55CST" if _MACRO_ALERTS_ENABLED else "macro_regime_watch DISABLED"
+    logger.info(f"[scheduler] registered: scanner_snapshots@15:25CST, sweep_digest@15:40CST, momentum_refresh@Sun18:00CST, {_macro_w}")
+    _earn = (
+        "pre_earnings@8:30CST, polling 15:00–18:00 CST"
+        if _EARNINGS_JOBS_ENABLED
+        else "earnings jobs DISABLED (set EARNINGS_JOBS_ENABLED=1 to re-enable)"
+    )
     logger.info(
-        "[scheduler] registered: news_summary@8:00CST, pre_earnings@8:30CST, "
-        "momentum@8:45CST, polling 15:00–18:00 CST, tos_gmail_watchlist@19:15CST, "
+        f"[scheduler] registered: news_summary@8:00CST, news_summary_post_market@15:35CST, {_earn}, "
+        "momentum@8:45CST, tos_gmail_watchlist@19:15CST, "
         "spy_gamma + sector_gamma after open and after close Mon–Fri"
     )

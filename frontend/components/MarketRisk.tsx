@@ -242,6 +242,76 @@ export default function MarketRisk() {
     risk.score <= 2  ? "bg-yellow" :
                        "bg-red";
 
+  // ── One-liner day verdict — synthesizes GEX regime + BTD state + risk score
+  // into a single Buy / Sell / Sideline call. Sell-first ordering: any
+  // single warning sign tilts the verdict away from buy. The tooltip
+  // surfaces the reasoning so the user can drill into why.
+  const dayVerdict = (() => {
+    const gexAvail   = data.gex?.available === true;
+    const gexRegime  = gexAvail ? (data.gex?.regime ?? null) : null;
+    const btdState   = data.btd?.btd_state;
+
+    const sellReasons: string[] = [];
+    if (gexRegime === "Short Gamma") sellReasons.push("γ Short Gamma");
+    if (gexRegime === "Near Flip")   sellReasons.push("γ Near Flip");
+    if (btdState === "DISARMED")     sellReasons.push("BTD DISARMED");
+    if (risk.score >= 3)             sellReasons.push(`Risk ${risk.score} (HIGH)`);
+    if (sellReasons.length > 0) {
+      return {
+        label: "Day to Sell",
+        emoji: "📉",
+        style: "border-red/40 bg-red/10 text-red",
+        reason: `Sell bias — ${sellReasons.join(" · ")}`,
+      };
+    }
+
+    // "Day to Buy" requires price to actually be in a pullback or just-
+    // triggered — NOT extended above 20EMA waiting for one. The btd_zone
+    // field carries the locational truth that btd_state alone smears over.
+    const btdZone = data.btd?.btd_zone ?? "";
+    const isPullbackOrTrigger = (
+      btdState === "TRIGGER"                                 // reclaim fired
+      || (btdState === "ARMED"      && btdZone === "dip 20–50EMA")  // shallow pullback
+      || (btdState === "ARMED-DEEP" && btdZone === "deep dip <50EMA") // deep pullback, half size
+    );
+    const isExtended = btdState === "ARMED" && btdZone === "extended >20EMA";
+
+    const buyReasons: string[] = [];
+    if (gexRegime === "Long Gamma") buyReasons.push("γ Long Gamma");
+    if (isPullbackOrTrigger)        buyReasons.push(`BTD ${btdState} (${btdZone})`);
+    if (risk.score <= 2)            buyReasons.push(`Risk ${risk.score}/MOD or better`);
+    if (gexRegime === "Long Gamma" && isPullbackOrTrigger && risk.score <= 2) {
+      return {
+        label: "Day to Buy",
+        emoji: "📈",
+        style: "border-green/40 bg-green/10 text-green",
+        reason: `Buy bias — ${buyReasons.join(" · ")}` +
+                (btdState === "ARMED-DEEP" ? " · half size — deeper risk" : ""),
+      };
+    }
+
+    // ARMED-but-extended deserves its own clear label: environment OK,
+    // but price is above 20EMA with no recent dip — don't chase here.
+    if (gexRegime === "Long Gamma" && isExtended && risk.score <= 2) {
+      return {
+        label: "Wait for pullback",
+        emoji: "⏳",
+        style: "border-accent/40 bg-accent/10 text-accent",
+        reason: `Environment OK (γ Long Gamma · Risk ${risk.score}) but ` +
+                "BTD ARMED · extended >20EMA — no entry trigger. Wait for " +
+                "price to pull back to 20EMA, then a close-above fires TRIGGER.",
+      };
+    }
+
+    // Default — mixed signals or unconfirmed regime
+    return {
+      label: "Sideline",
+      emoji: "⏸",
+      style: "border-yellow/40 bg-yellow/10 text-yellow",
+      reason: `Mixed — γ:${gexRegime ?? "?"} · BTD:${btdState ?? "?"} · Risk:${risk.score}`,
+    };
+  })();
+
   const keyItems = KEY_TICKERS
     .map(t => items.find(i => i.ticker === t))
     .filter(Boolean) as MacroItem[];
@@ -255,6 +325,15 @@ export default function MarketRisk() {
         <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded border text-[11px] font-bold tracking-wide ${riskStyles}`}>
           <span className={`w-1.5 h-1.5 rounded-full ${riskDot}`} />
           MARKET RISK: {risk.label}
+        </div>
+
+        {/* One-liner verdict — synthesizes γ + BTD + risk into a single call */}
+        <div
+          className={`flex items-center gap-1.5 px-2.5 py-1 rounded border text-[11px] font-bold tracking-wide ${dayVerdict.style}`}
+          title={dayVerdict.reason}
+        >
+          <span>{dayVerdict.emoji}</span>
+          {dayVerdict.label}
         </div>
 
         {(() => {

@@ -62,3 +62,27 @@ def trigger_momentum_scan():
     from backend.services.scheduler import momentum_scan_job
     momentum_scan_job()
     return {"status": "momentum scan completed"}
+
+
+@router.post("/run-news")
+def trigger_news_summary():
+    """Manually trigger the morning Good/Bad news digest."""
+    from backend.services.scheduler import news_summary_job
+    news_summary_job()
+    return {"status": "news summary completed"}
+
+
+@router.post("/run-news-post")
+def trigger_post_market_news_summary():
+    """Manually trigger the post-market Good/Bad news digest."""
+    from backend.services.scheduler import post_market_news_summary_job
+    post_market_news_summary_job()
+    return {"status": "post-market news summary completed"}
+
+
+@router.post("/run-sweeps")
+def trigger_sweep_digest():
+    """Manually trigger the post-market sweep setup digest."""
+    from backend.services.scheduler import sweep_digest_job
+    sweep_digest_job()
+    return {"status": "sweep digest completed"}
