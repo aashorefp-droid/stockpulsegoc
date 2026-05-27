@@ -23,6 +23,16 @@ type Filter = "all" | "actionable" | "rank1" | "exceptional" | "high_short" | "d
 
 const isBtdLive = (s?: string) => s === "TRIGGER" || s === "ARMED" || s === "ARMED-DEEP";
 type SortBy = "score" | "grade" | "rr" | "swingReward" | "fibReward" | "dayReward" | "ltEntryPct" | "valuation" | "longRunway" | "cyclicalPeak" | "multiBagger" | "newsGood" | "newsBad";
+type ScannerMode = "overview" | "swing" | "longterm" | "fib" | "daytrading" | "options";
+
+const SCANNER_MODES: { key: ScannerMode; label: string; title: string; sort: SortBy }[] = [
+  { key: "overview",   label: "Overview",  title: "Full scanner with every column group", sort: "score" },
+  { key: "swing",      label: "Swing",     title: "Swing entries, PreBO, BTD Trigger, EMAs", sort: "swingReward" },
+  { key: "longterm",   label: "Long Term", title: "Long-term setup, valuation, fundamentals", sort: "valuation" },
+  { key: "fib",        label: "Fib",       title: "Fib target, ladders, earnings swing zones", sort: "fibReward" },
+  { key: "daytrading", label: "Day V4",    title: "CPR, next-day, and Day Trading V4 plans", sort: "dayReward" },
+  { key: "options",    label: "Options",   title: "Options strategy and OTM liquidity", sort: "score" },
+];
 
 type Seasonality = {
   available?: boolean;
@@ -728,6 +738,7 @@ export default function ScannerPage() {
   // ~0.5–2s/ticker), so this toggle lets the user pull news only when they
   // need it for that particular scan run.
   const [includeNews, setIncludeNews] = useState(false);
+  const [scannerMode, setScannerMode] = useState<ScannerMode>("overview");
   // Multi-select: empty set = "All" (show everything). Clicking a chip
   // toggles its membership; clicking "All" clears the set.
   const [filters, setFilters] = useState<Set<Filter>>(new Set());
@@ -740,6 +751,17 @@ export default function ScannerPage() {
     });
   const clearFilters = () => setFilters(new Set());
   const [sortBy,       setSortBy]       = useState<SortBy>("score");
+  const selectScannerMode = (next: ScannerMode) => {
+    if (next === scannerMode) return;
+    setScannerMode(next);
+    setFilters(new Set());
+    setSortBy(SCANNER_MODES.find(m => m.key === next)?.sort ?? "score");
+    setResults([]);
+    setPooled([]);
+    setProgress({ done: 0, total: 0 });
+    setSnapshotStatus("");
+    setActiveBacktestDate(null);
+  };
   const [optModal,     setOptModal]     = useState<{ r: ScanResult } | null>(null);
   const [otmModal,     setOtmModal]     = useState<{ r: ScanResult } | null>(null);
   const [btdModal,     setBtdModal]     = useState<{ r: ScanResult } | null>(null);
@@ -855,7 +877,7 @@ export default function ScannerPage() {
       setAuto15mStatus(`Auto-updating 15m volume (${tickers.length})`);
       refresh15mRef.current?.close();
 
-      const es = new EventSource(`${API_BASE}/api/scanner/stream?tickers=${encodeURIComponent(tickers.join(","))}`);
+      const es = new EventSource(`${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scannerMode)}&tickers=${encodeURIComponent(tickers.join(","))}`);
       refresh15mRef.current = es;
 
       es.onmessage = (e) => {
@@ -891,7 +913,7 @@ export default function ScannerPage() {
       window.clearTimeout(first);
       window.clearInterval(every);
     };
-  }, [mode, scanning, progress.done, progress.total, pending15mKey, results]);
+  }, [mode, scannerMode, scanning, progress.done, progress.total, pending15mKey, results]);
 
   // ── V3 auto-refresh ──────────────────────────────────────────────────────
   // Re-evaluate ONLY the V3 day-trading engine for the current rows every 5
@@ -1068,7 +1090,7 @@ export default function ScannerPage() {
     }
 
     // For saved daily snapshots in live mode, prefer the Neon-backed snapshot (faster).
-    if (mode === "live" && SNAPSHOT_WATCHLISTS.includes(scanWatchlist)) {
+    if (mode === "live" && scannerMode === "overview" && SNAPSHOT_WATCHLISTS.includes(scanWatchlist)) {
       loadSnapshot(scanWatchlist);
       return;
     }
@@ -1082,10 +1104,10 @@ export default function ScannerPage() {
       const tickers = customInput.split(",").map(t => t.trim().toUpperCase()).filter(Boolean);
       if (!tickers.length) return;
       total = tickers.length;
-      url = `${API_BASE}/api/scanner/stream?tickers=${encodeURIComponent(tickers.join(","))}`;
+      url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scannerMode)}&tickers=${encodeURIComponent(tickers.join(","))}`;
     } else {
       total = WATCHLISTS.find(w => w.key === scanWatchlist)?.count ?? 50;
-      url = `${API_BASE}/api/scanner/stream?watchlist=${scanWatchlist}`;
+      url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scannerMode)}&watchlist=${scanWatchlist}`;
     }
 
     if (mode === "backtest" && backtestDate) {
@@ -1174,9 +1196,9 @@ export default function ScannerPage() {
       if (watchlist === "custom") {
         const tickers = customInput.split(",").map(t => t.trim().toUpperCase()).filter(Boolean);
         if (!tickers.length) { resolve([]); return; }
-        url = `${API_BASE}/api/scanner/stream?tickers=${encodeURIComponent(tickers.join(","))}&as_of=${asOf}`;
+        url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scannerMode)}&tickers=${encodeURIComponent(tickers.join(","))}&as_of=${asOf}`;
       } else {
-        url = `${API_BASE}/api/scanner/stream?watchlist=${watchlist}&as_of=${asOf}`;
+        url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scannerMode)}&watchlist=${watchlist}&as_of=${asOf}`;
       }
       if (includeNews) url += `&include_news=1`;
       const acc: ScanResult[] = [];
@@ -1325,7 +1347,15 @@ export default function ScannerPage() {
   const errors  = results.filter(r => r.error);
   const pct     = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
   const selectedWatchlist = WATCHLISTS.find(w => w.key === watchlist);
+  const selectedScannerMode = SCANNER_MODES.find(m => m.key === scannerMode) ?? SCANNER_MODES[0];
   const customTickerCount = customInput.split(",").filter(t => t.trim()).length;
+  const showLongTermCol = scannerMode === "overview" || scannerMode === "longterm";
+  const showSwingCol = scannerMode === "overview" || scannerMode === "swing";
+  const showFibCol = scannerMode === "overview" || scannerMode === "fib";
+  const showDayTradingCol = scannerMode === "overview" || scannerMode === "daytrading";
+  const showNextDayCol = scannerMode === "overview" || scannerMode === "daytrading";
+  const showShortCol = scannerMode === "overview" || scannerMode === "longterm";
+  const showOptionsCol = scannerMode === "overview" || scannerMode === "options";
 
   return (
     <div className="space-y-4">
@@ -1365,6 +1395,27 @@ export default function ScannerPage() {
             </span>
           </button>
           <span className="shrink-0 rounded border border-border bg-surface px-2 py-1 text-[11px] font-bold uppercase tracking-wide text-muted">
+            Scanner
+          </span>
+          <div className="flex shrink-0 rounded-lg border border-border bg-surface overflow-hidden">
+            {SCANNER_MODES.map(m => (
+              <button
+                key={m.key}
+                type="button"
+                onClick={() => selectScannerMode(m.key)}
+                disabled={scanning}
+                title={m.title}
+                className={`px-3 py-1.5 text-xs font-semibold transition-colors border-l border-border first:border-l-0 ${
+                  scannerMode === m.key
+                    ? "bg-accent text-black"
+                    : "text-muted hover:text-white bg-transparent"
+                } ${scanning ? "opacity-50 cursor-not-allowed" : ""}`}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+          <span className="shrink-0 rounded border border-border bg-surface px-2 py-1 text-[11px] font-bold uppercase tracking-wide text-muted">
             Mode
           </span>
           <div className="flex shrink-0 rounded-lg border border-border bg-surface overflow-hidden">
@@ -1402,6 +1453,7 @@ export default function ScannerPage() {
           <button
             onClick={scanning ? stopScan : () => startScan()}
             disabled={!scanning && mode === "backtest" && !backtestDate}
+            title={`${selectedScannerMode.label} scanner`}
             className={`shrink-0 px-6 py-1.5 rounded-lg font-bold text-sm uppercase tracking-wide transition-all ${
               scanning
                 ? "bg-red/20 text-red border border-red/30 hover:bg-red/30"
@@ -2103,26 +2155,26 @@ export default function ScannerPage() {
                   <th className="w-[88px] min-w-[88px] max-w-[88px] text-center px-2 py-3">Sector</th>
                   <th className="text-right px-3 py-3 whitespace-nowrap">Price</th>
                   <th className="text-center px-3 py-3 whitespace-nowrap">Verdict</th>
-                  <th className="text-center px-3 py-3 whitespace-nowrap" title="Long Term scans weekly bars for spring action. A green sprout appears in rows when detected.">
+                  <th className={`${showLongTermCol ? "" : "hidden"} text-center px-3 py-3 whitespace-nowrap`} title="Long Term scans weekly bars for spring action. A green sprout appears in rows when detected.">
                     Long Term <span className="text-green/60">{"\u{1F331}"}</span>
                   </th>
-                  <th className="text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-accent" title="Swing scans daily bars for spring action. A green sprout appears in rows when detected. Includes the per-ticker BTD badge (Buy-The-Dip: 20/50/200 EMA structure) — double-click it for full detail + copy. Pair with the market BTD/γ badge in the top bar.">
+                  <th className={`${showSwingCol ? "" : "hidden"} text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-accent`} title="Swing scans daily bars for spring action. A green sprout appears in rows when detected. Includes the per-ticker BTD badge (Buy-The-Dip: 20/50/200 EMA structure) — double-click it for full detail + copy. Pair with the market BTD/γ badge in the top bar.">
                     SWING <span className="text-green/60">{"\u{1F331}"}</span>
                   </th>
-                  <th className="text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-green" title="Directional Fibonacci target from the last earnings swing when available, otherwise the 52-week swing. Separate from the risk-based Swing T1.">
+                  <th className={`${showFibCol ? "" : "hidden"} text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-green`} title="Directional Fibonacci target from the last earnings swing when available, otherwise the 52-week swing. Separate from the risk-based Swing T1.">
                     Fib Target
                   </th>
-                  <th className="text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-yellow" title="Day Trading includes CPR triggers plus V4 PDH/PDL/PWH/PWL next-session plans. A green sprout appears in rows when detected.">
+                  <th className={`${showDayTradingCol ? "" : "hidden"} text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-yellow`} title="Day Trading includes CPR triggers plus V4 PDH/PDL/PWH/PWL next-session plans. A green sprout appears in rows when detected.">
                     Day Trading <span className="text-green/60">{"\u{1F331}"}</span>
                   </th>
-                  <th className="text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-muted" title="Prediction only. Use with caution and confirm with price action.">
+                  <th className={`${showNextDayCol ? "" : "hidden"} text-left px-2 py-3 whitespace-nowrap border-l border-border/60 text-muted`} title="Prediction only. Use with caution and confirm with price action.">
                     <span className="block leading-tight">
                       <span className="block">Next Day</span>
                       <span className="block text-[9px] font-normal text-yellow">(Prediction/use with Caution)</span>
                     </span>
                   </th>
-                  <th className="w-[42px] text-right px-1.5 py-3 whitespace-nowrap">Short%</th>
-                  <th className="text-left px-3 py-3 whitespace-nowrap">Options</th>
+                  <th className={`${showShortCol ? "" : "hidden"} w-[42px] text-right px-1.5 py-3 whitespace-nowrap`}>Short%</th>
+                  <th className={`${showOptionsCol ? "" : "hidden"} text-left px-3 py-3 whitespace-nowrap`}>Options</th>
                 </tr>
               </thead>
               <tbody>
@@ -2257,7 +2309,7 @@ export default function ScannerPage() {
                           )}
                         </div>
                       </td>
-                      <td className="px-3 py-2.5 text-center whitespace-nowrap" title={r.lre_reason ?? ""}>
+                      <td className={`${showLongTermCol ? "" : "hidden"} px-3 py-2.5 text-center whitespace-nowrap`} title={r.lre_reason ?? ""}>
                         {r.long_term_spring && (
                           <div className="mb-1 inline-flex items-center justify-center gap-1 text-[10px] font-mono text-green">
                             <SpringMarker title={r.long_term_spring_text} />
@@ -2413,7 +2465,7 @@ export default function ScannerPage() {
                           </a>
                         </div>
                       </td>
-                      <td className="px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30">
+                      <td className={`${showSwingCol ? "" : "hidden"} px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30`}>
                         <div className="flex flex-col gap-0.5 font-mono leading-tight">
                           {(r.multi_bagger || r.long_runway) && (
                             <span
@@ -2629,7 +2681,7 @@ export default function ScannerPage() {
                         </div>
                       </td>
                       <td
-                        className={`group px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30 ${
+                        className={`${showFibCol ? "" : "hidden"} group px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30 ${
                           r.fib_target != null || r.near_fib_name
                             ? "cursor-pointer focus:outline-none focus:ring-1 focus:ring-green/40"
                             : ""
@@ -2735,7 +2787,7 @@ export default function ScannerPage() {
                         )}
                       </td>
                       <td
-                        className="px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30"
+                        className={`${showDayTradingCol ? "" : "hidden"} px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30`}
                         title={[r.cpr_interpretation, r.day_spring_text, r.dt4_note, r.dt4_exit_plan, r.cpr_day_15m_volume_text, r.cpr_day_volume_text, r.cpr_day_ref].filter(Boolean).join(" | ") || undefined}
                       >
                         {r.cpr_day_result ? (
@@ -2908,7 +2960,7 @@ export default function ScannerPage() {
                         ) : <span className="text-muted/40">—</span>}
                       </td>
                       <td
-                        className="px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30"
+                        className={`${showNextDayCol ? "" : "hidden"} px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30`}
                         title={r.next_day_summary ?? r.next_day_prediction ?? undefined}
                       >
                         {(r.next_day_outcome || r.next_day_bias) ? (
@@ -2935,14 +2987,14 @@ export default function ScannerPage() {
                           </div>
                         ) : <span className="text-muted/40">N/A</span>}
                       </td>
-                      <td className="w-[42px] px-1.5 py-2 text-right font-mono text-xs whitespace-nowrap">
+                      <td className={`${showShortCol ? "" : "hidden"} w-[42px] px-1.5 py-2 text-right font-mono text-xs whitespace-nowrap`}>
                         {r.short_pct != null
                           ? <span className={r.short_pct >= 20 ? "text-red font-bold" : r.short_pct >= 10 ? "text-yellow" : "text-muted"}>
                               {Math.round(r.short_pct)}%
                             </span>
                           : <span className="text-muted">—</span>}
                       </td>
-                      <td className="px-3 py-2.5 text-left whitespace-nowrap">
+                      <td className={`${showOptionsCol ? "" : "hidden"} px-3 py-2.5 text-left whitespace-nowrap`}>
                         <div className="flex flex-col gap-1.5">
                           <div
                             onDoubleClick={() => (r.opt_summary || r.opt_alt) && setOptModal({ r })}
