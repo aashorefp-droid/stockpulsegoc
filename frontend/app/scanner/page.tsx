@@ -112,6 +112,8 @@ interface ScanResult {
   fib_target?: number | null;
   fib_target_name?: string | null;
   fib_target_reward_pct?: number | null;
+  fib_target_ladder?: { kind: string; label: string; price: number; reward_pct?: number | null }[] | null;
+  fib_reclaim_ladder?: { kind: string; label: string; price: number; reward_pct?: number | null }[] | null;
   fib_target_source?: string | null;
   fib_pos_pct?: number | null;
   fib_swing_low?: number | null;
@@ -245,6 +247,17 @@ interface ScanResult {
   entry?:        number;
   stop_loss?:    number;
   target1?:      number;
+  target2?:      number;
+  t1_days?:      number | null;
+  t1_days_min?:  number | null;
+  t1_days_max?:  number | null;
+  t1_days_text?: string | null;
+  t1_days_basis?: string | null;
+  t2_days?:      number | null;
+  t2_days_min?:  number | null;
+  t2_days_max?:  number | null;
+  t2_days_text?: string | null;
+  t2_days_basis?: string | null;
   risk_pct?:     number;
   rr_t1?:        number;
   atr?:          number;
@@ -517,6 +530,69 @@ function rewardPct(entry?: number | null, target?: number | null): string {
   return `${(Math.abs(target - entry) / entry * 100).toFixed(2)}%`;
 }
 
+function approxDays(days?: number | null, text?: string | null): string {
+  if (text) return text;
+  if (days == null || !Number.isFinite(days) || days <= 0) return "—";
+  return `~${Math.round(days)}d`;
+}
+
+function targetLadderText(r: ScanResult, maxItems = 6): string {
+  return ladderText(r.fib_target_ladder, maxItems);
+}
+
+function ladderText(
+  ladder?: { kind: string; label: string; price: number; reward_pct?: number | null }[] | null,
+  maxItems = 6,
+): string {
+  const rows = (ladder ?? [])
+    .filter(x => typeof x.price === "number" && Number.isFinite(x.price))
+    .slice(0, maxItems);
+  if (!rows.length) return "";
+  return rows.map(x => {
+    const label = x.kind === "Fib" && x.label ? x.label : "round";
+    const reward = x.reward_pct != null ? `, ${x.reward_pct.toFixed(2)}%` : "";
+    return `${fmtMoney(x.price)} (${label}${reward})`;
+  }).join(" / ");
+}
+
+function fibDetailText(r: ScanResult): string {
+  const reward = r.fib_target_reward_pct != null
+    ? `${r.fib_target_reward_pct.toFixed(2)}%`
+    : rewardPct(r.price, r.fib_target);
+  const targetLevels = targetLadderText(r);
+  const reclaimLevels = ladderText(r.fib_reclaim_ladder, 4);
+  return [
+    `${r.ticker} - Fibonacci Target`,
+    "",
+    `Price: ${fmtMoney(r.price)}`,
+    r.direction ? `Direction: ${r.direction}` : null,
+    `Target: ${fmtMoney(r.fib_target)}`,
+    `Target level: ${r.fib_target_name ?? "-"}`,
+    `Reward: ${reward}`,
+    targetLevels ? `Fib target ladder: ${targetLevels}` : null,
+    reclaimLevels ? `${r.direction === "SHORT" ? "Reclaim levels" : "Rejection levels"}: ${reclaimLevels}` : null,
+    r.near_fib_name && r.near_fib_price != null
+      ? `Nearest Fib: ${r.near_fib_name} ${fmtMoney(r.near_fib_price)}`
+      : null,
+    r.fib_swing_low != null && r.fib_swing_high != null
+      ? `Swing range: ${fmtMoney(r.fib_swing_low)} to ${fmtMoney(r.fib_swing_high)}`
+      : null,
+    r.fib_swing_range != null ? `Swing size: ${fmtMoney(r.fib_swing_range)}` : null,
+    r.fib_pos_pct != null ? `Swing position: ${r.fib_pos_pct}%` : null,
+    r.weekly_pos_pct != null ? `Weekly position: ${r.weekly_pos_pct}%` : null,
+    r.earn_zone ? `Earnings zone: ${r.earn_zone}` : null,
+    r.weekly_zone ? `Weekly zone: ${r.weekly_zone}` : null,
+    r.fib_target_source ? `Source: ${r.fib_target_source}` : null,
+    r.fib_earn_window ? `Earnings window: ${r.fib_earn_window}` : null,
+    r.fib_prev_earnings ? `Prev earnings: ${r.fib_prev_earnings}` : null,
+    r.fib_last_earnings ? `Last earnings: ${r.fib_last_earnings}` : null,
+    r.fib_next_earnings ? `Next earnings: ${r.fib_next_earnings}` : null,
+    r.fib_compression ? "Fib compression: Yes" : null,
+    r.fib_commentary ? "" : null,
+    r.fib_commentary,
+  ].filter((v): v is string => typeof v === "string").join("\n");
+}
+
 function fmtEarnings(d?: string | null): { text: string; days: number | null; soon: boolean } | null {
   if (!d) return null;
   const dt = new Date(`${d}T00:00:00`);
@@ -606,6 +682,7 @@ export default function ScannerPage() {
   const [otmModal,     setOtmModal]     = useState<{ r: ScanResult } | null>(null);
   const [btdModal,     setBtdModal]     = useState<{ r: ScanResult } | null>(null);
   const [newsModal,    setNewsModal]    = useState<{ r: ScanResult } | null>(null);
+  const [fibModal,     setFibModal]     = useState<{ r: ScanResult } | null>(null);
   const [seasonModal,  setSeasonModal]  = useState<
     { ticker: string; loading: boolean; data: Seasonality | null; error?: string } | null
   >(null);
@@ -655,6 +732,13 @@ export default function ScannerPage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [newsModal]);
+
+  useEffect(() => {
+    if (!fibModal) return;
+    function onKey(e: KeyboardEvent) { if (e.key === "Escape") setFibModal(null); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fibModal]);
 
   useEffect(() => {
     if (!seasonModal) return;
@@ -1888,7 +1972,7 @@ export default function ScannerPage() {
                 "Ticker","Sector","Price","Verdict","BTD","BTD Zone","Long Term Grade","Long Term Status",
                 "Verdict Flip Date","Verdict Flip From","Days Since Flip",
                 "Long Term Entry Range","Long Term % From Entry","Long Term Risk%","Long Term Spring","Valuation","Valuation Fair Value","Valuation Upside%","Valuation Source","Valuation Reason",
-                "Swing Entry","Swing Stop","Swing T1","Swing Reward%","Swing Risk%","Swing R/R","Swing Invalidation","Swing Spring",
+                "Swing Entry","Swing Stop","Swing T1","Swing T1 Approx Days","Swing Reward%","Swing Risk%","Swing R/R","Swing Invalidation","Swing Spring",
                 "Fib Target","Fib Reward%","Fib Level","Fib Source","Fib Commentary","Prev Earnings","Last Earnings","Next Earnings (Fib)","Earn Zone","Weekly Zone","Nearest Fib","Fib Compression",
                 "News","Next Earnings",
                 "Day Trading Result","Day Trading Entry","Day Trading Stop","Day Trading T1","Day Trading Reward%","Day Trading Spring","Day Trading Trigger","Day Trading Invalidation","Day Trading Target Plan","Day Trading Volume Confirm","Day Trading 15m Volume Confirm","Day Trading Ref",
@@ -1905,7 +1989,7 @@ export default function ScannerPage() {
                   r.verdict_flip_date, r.verdict_flip_from, r.verdict_flip_days,
                   lreRangeText(r), lreFromEntry, r.lre_risk_pct, r.long_term_spring_text,
                   r.valuation_label, valuationFairValue(r), valuationUpsidePct(r), r.valuation_source, r.valuation_reason,
-                  r.entry, r.stop_loss, r.target1, rewardPct(r.entry, r.target1), r.risk_pct, r.rr_t1, r.swing_invalidation_text, r.swing_spring_text,
+                  r.entry, r.stop_loss, r.target1, r.t1_days_text ?? r.t1_days ?? "", rewardPct(r.entry, r.target1), r.risk_pct, r.rr_t1, r.swing_invalidation_text, r.swing_spring_text,
                   r.fib_target, r.fib_target_reward_pct != null ? `${r.fib_target_reward_pct.toFixed(2)}%` : "",
                   r.fib_target_name, r.fib_target_source, r.fib_commentary,
                   r.fib_prev_earnings, r.fib_last_earnings, r.fib_next_earnings,
@@ -2318,10 +2402,17 @@ export default function ScannerPage() {
                               {r.verdict ? `, ${r.verdict}` : ""}, {r.lre_takeaway}
                             </span>
                           )}
-                          <div className="grid grid-cols-[34px_64px] gap-x-1 gap-y-0.5">
+                          <div className="grid grid-cols-[44px_64px] gap-x-1 gap-y-0.5">
                             <span className="text-muted">Entry</span><span className="text-right text-accent">{fmtMoney(r.entry)}</span>
                             <span className="text-muted">Stop</span><span className="text-right text-red">{fmtMoney(r.stop_loss)}</span>
                             <span className="text-muted">T1</span><span className="text-right text-green">{fmtMoney(r.target1)}</span>
+                            <span
+                              className="text-muted"
+                              title={r.t1_days_basis || "Approximate trading days to Swing T1"}
+                            >
+                              T1 ETA
+                            </span>
+                            <span className="text-right text-green/80">{approxDays(r.t1_days, r.t1_days_text)}</span>
                             <span className="text-muted">Reward</span><span className="text-right text-green">{rewardPct(r.entry, r.target1)}</span>
                             <span className="text-muted">Risk</span><span className="text-right text-muted">{r.risk_pct ? `${r.risk_pct}%` : "—"}</span>
                             {r.wk_atr != null && (
@@ -2424,14 +2515,34 @@ export default function ScannerPage() {
                         </div>
                       </td>
                       <td
-                        className="px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30"
+                        className={`group px-2 py-2 text-left text-[10px] whitespace-nowrap border-l border-border/30 ${
+                          r.fib_target != null || r.near_fib_name
+                            ? "cursor-pointer focus:outline-none focus:ring-1 focus:ring-green/40"
+                            : ""
+                        }`}
+                        role={r.fib_target != null || r.near_fib_name ? "button" : undefined}
+                        tabIndex={r.fib_target != null || r.near_fib_name ? 0 : undefined}
+                        aria-label={r.fib_target != null || r.near_fib_name ? `${r.ticker} Fib Target details` : undefined}
+                        onClick={() => (r.fib_target != null || r.near_fib_name) && setFibModal({ r })}
+                        onKeyDown={e => {
+                          if (!(r.fib_target != null || r.near_fib_name)) return;
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            setFibModal({ r });
+                          }
+                        }}
                         title={[
+                          r.fib_target != null ? `Fib target ${fmtMoney(r.fib_target)}` : null,
+                          r.fib_target_name ? `Target level ${r.fib_target_name}` : null,
+                          r.fib_target_reward_pct != null ? `Reward ${r.fib_target_reward_pct.toFixed(2)}%` : null,
+                          targetLadderText(r) ? `Fib target ladder ${targetLadderText(r)}` : null,
+                          r.near_fib_name && r.near_fib_price != null ? `Nearest Fib ${r.near_fib_name} ${fmtMoney(r.near_fib_price)}` : null,
+                          r.fib_swing_low != null && r.fib_swing_high != null ? `Swing range ${fmtMoney(r.fib_swing_low)} to ${fmtMoney(r.fib_swing_high)}` : null,
                           r.fib_commentary,
                           r.fib_next_earnings ? `Next earnings ${r.fib_next_earnings}` : null,
                           r.fib_last_earnings ? `Last earnings ${r.fib_last_earnings}` : null,
                           r.fib_target_source,
                           r.fib_earn_window ? `Earn window ${r.fib_earn_window}` : null,
-                          r.fib_swing_low != null && r.fib_swing_high != null ? `Swing ${fmtMoney(r.fib_swing_low)}-${fmtMoney(r.fib_swing_high)}` : null,
                           r.fib_pos_pct != null ? `Swing pos ${r.fib_pos_pct}%` : null,
                           r.weekly_pos_pct != null ? `Weekly pos ${r.weekly_pos_pct}%` : null,
                         ].filter(Boolean).join(" | ") || undefined}
@@ -2452,6 +2563,10 @@ export default function ScannerPage() {
                               <span className="text-muted">Near</span>
                               <span className="text-right text-muted/80 whitespace-normal">
                                 {r.near_fib_name ? `${r.near_fib_name} ${fmtMoney(r.near_fib_price)}` : "-"}
+                              </span>
+                              <span className="text-muted">Targets</span>
+                              <span className="text-right text-muted/80 whitespace-normal">
+                                {targetLadderText(r, 3) || "-"}
                               </span>
                               {(r.fib_next_earnings || r.fib_last_earnings) && (
                                 <>
@@ -2496,6 +2611,9 @@ export default function ScannerPage() {
                                   {r.fib_target_source}
                                 </span>
                               )}
+                              <span className="rounded border border-green/30 bg-green/10 px-1 py-0.5 text-[9px] text-green sm:opacity-0 sm:group-hover:opacity-100">
+                                Details
+                              </span>
                             </div>
                           </div>
                         ) : (
@@ -3008,6 +3126,45 @@ export default function ScannerPage() {
                 </a>
                 <button
                   onClick={() => setNewsModal(null)}
+                  className="px-4 py-1.5 text-xs font-semibold rounded-lg border border-border text-muted hover:text-white transition-colors"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Fib detail modal (tap the Fib Target cell) */}
+      {fibModal && (() => {
+        const r = fibModal.r;
+        const text = fibDetailText(r);
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+            onClick={() => setFibModal(null)}
+          >
+            <div
+              className="bg-card border border-border rounded-xl shadow-2xl p-5 w-full max-w-lg mx-4 space-y-3"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-white">{r.ticker} - Fib Target</span>
+                <button onClick={() => setFibModal(null)} className="text-muted hover:text-white text-lg leading-none">x</button>
+              </div>
+              <div className="max-h-[60vh] overflow-y-auto whitespace-pre-wrap rounded-lg border border-border bg-surface p-3 font-mono text-sm text-white">
+                {text}
+              </div>
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={() => copyText(text)}
+                  className="px-4 py-1.5 text-xs font-semibold rounded-lg bg-accent text-black hover:bg-accent/80 transition-colors"
+                >
+                  {copied ? "Copied" : "Copy"}
+                </button>
+                <button
+                  onClick={() => setFibModal(null)}
                   className="px-4 py-1.5 text-xs font-semibold rounded-lg border border-border text-muted hover:text-white transition-colors"
                 >
                   Close

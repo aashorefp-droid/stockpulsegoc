@@ -420,6 +420,8 @@ def momentum_scan_job():
         entry   = r.get("entry")
         stop    = r.get("stop_loss")
         t1      = r.get("target1")
+        t1_days = r.get("t1_days")
+        t1_eta  = r.get("t1_days_text")
         rr      = r.get("rr_t1")
         weekly  = r.get("weekly_bias", {})
         w_bias  = weekly.get("bias", "—") if isinstance(weekly, dict) else str(weekly)
@@ -430,6 +432,10 @@ def momentum_scan_job():
         line += f"\n   Weekly: {w_bias}"
         if entry and stop and t1:
             line += f"\n   Entry: ${entry:.2f}  Stop: ${stop:.2f}  T1: ${t1:.2f}"
+            if t1_eta:
+                line += f" ({t1_eta})"
+            elif t1_days:
+                line += f" (~{int(t1_days)}d)"
             if rr:
                 line += f"  R:R {rr:.1f}×"
         if opt_sum:

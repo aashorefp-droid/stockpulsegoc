@@ -7,7 +7,9 @@ interface Trade {
   rr_t1:     number | null;
   rr_t2:     number | null;
   t1_days:   number | null;
+  t1_days_text?: string | null;
   t2_days:   number | null;
+  t2_days_text?: string | null;
   atr:       number;
 }
 
@@ -27,6 +29,11 @@ function Row({ label, value, color }: { label: string; value: string; color?: st
       <span className={`font-mono font-semibold ${color ?? "text-white"}`}>{value}</span>
     </div>
   );
+}
+
+function eta(days: number | null, text?: string | null): string {
+  if (text) return ` (${text})`;
+  return days ? ` (~${days}d)` : "";
 }
 
 export default function TradeCard({
@@ -54,8 +61,8 @@ export default function TradeCard({
 
       <Row label="Entry"     value={`$${trade.entry}`}    color="text-accent" />
       <Row label="Stop Loss" value={`$${trade.stop_loss}`} color={stopColor} />
-      <Row label="Target 1"  value={`$${trade.target1}${trade.t1_days ? ` (~${trade.t1_days}d)` : ""}`} color={t1Color} />
-      <Row label="Target 2"  value={`$${trade.target2}${trade.t2_days ? ` (~${trade.t2_days}d)` : ""}`} color={t1Color} />
+      <Row label="Target 1"  value={`$${trade.target1}${eta(trade.t1_days, trade.t1_days_text)}`} color={t1Color} />
+      <Row label="Target 2"  value={`$${trade.target2}${eta(trade.t2_days, trade.t2_days_text)}`} color={t1Color} />
 
       <div className="mt-3 pt-3 border-t border-border grid grid-cols-3 gap-2 text-center">
         <div>

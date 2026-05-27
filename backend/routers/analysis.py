@@ -23,7 +23,11 @@ router = APIRouter(prefix="/api/analysis", tags=["analysis"])
 
 _EMPTY_GRADE  = {"entry_grade": "D", "entry_label": "N/A", "expected_wr": 0, "expected_avg": 0, "grade_color": "#8b949e"}
 _EMPTY_TRADE  = {"entry": 0, "stop_loss": None, "target1": None, "target2": None,
-                 "risk_pct": None, "rr_t1": None, "rr_t2": None, "t1_days": None, "t2_days": None, "atr": 0}
+                 "risk_pct": None, "rr_t1": None, "rr_t2": None,
+                 "t1_days": None, "t1_days_min": None, "t1_days_max": None,
+                 "t1_days_text": None, "t1_days_basis": None,
+                 "t2_days": None, "t2_days_min": None, "t2_days_max": None,
+                 "t2_days_text": None, "t2_days_basis": None, "atr": 0}
 _EMPTY_SIGNAL = {"rank": 5, "signal": "No edge", "action": "Sit out", "key": "N/N/N"}
 
 

@@ -1562,6 +1562,58 @@ def _directional_fib_target(levels: dict[str, float], price: float, direction: s
     return above[0] if above else (None, None)
 
 
+def _fib_target_ladder(levels: dict[str, float], price: float, direction: str) -> list[dict]:
+    if price <= 0:
+        return []
+    eps = max(price * 0.001, 0.01)
+    rows = []
+    for name, val in levels.items():
+        try:
+            v = float(val)
+        except Exception:
+            continue
+        if direction == "SHORT" and v < price - eps:
+            rows.append({"kind": "Fib", "label": name, "price": v})
+        elif direction != "SHORT" and v > price + eps:
+            rows.append({"kind": "Fib", "label": name, "price": v})
+    rows.sort(key=lambda r: r["price"], reverse=(direction == "SHORT"))
+
+    out: list[dict] = []
+    for row in rows:
+        p = float(row["price"])
+        if any(abs(float(x["price"]) - p) <= max(0.25, price * 0.001) for x in out):
+            continue
+        out.append({
+            "kind": row["kind"],
+            "label": row["label"],
+            "price": _round2(p),
+            "reward_pct": _round2(abs(p - price) / price * 100),
+        })
+        if len(out) >= 6:
+            break
+    return out
+
+
+def _ladder_prices(rows: list[dict], *, above: Optional[float] = None,
+                   below: Optional[float] = None, limit: int = 3) -> str:
+    vals: list[float] = []
+    for row in rows:
+        try:
+            price = float(row.get("price"))
+        except Exception:
+            continue
+        if above is not None and price <= above:
+            continue
+        if below is not None and price >= below:
+            continue
+        if any(abs(v - price) <= max(0.25, abs(price) * 0.001) for v in vals):
+            continue
+        vals.append(price)
+        if len(vals) >= limit:
+            break
+    return " / ".join(f"${v:.2f}" for v in vals)
+
+
 def _weekly_fib_zone_fields(daily_df: pd.DataFrame, price: float) -> dict:
     if daily_df is None or daily_df.empty or price <= 0:
         return {}
@@ -1646,11 +1698,14 @@ def _fib_earnings_commentary(
     prev_earnings: Optional[str],
     last_earnings: Optional[str],
     next_earnings: Optional[str],
+    target_ladder: Optional[list[dict]] = None,
+    reclaim_ladder: Optional[list[dict]] = None,
 ) -> str:
     target_txt = (
         f"{target_name} ${target_val:.2f}" if target_name and target_val is not None
         else f"{near_name} ${near_val:.2f}"
     )
+    level_txt = f"${target_val:.2f}" if target_val is not None else f"${near_val:.2f}"
     reward_txt = f" ({reward_pct:.2f}% away)" if reward_pct is not None else ""
     date_bits: list[str] = []
     if next_earnings:
@@ -1667,10 +1722,39 @@ def _fib_earnings_commentary(
         else f"{target_txt} is the next Fib checkpoint"
     )
 
+    target_ladder = target_ladder or []
+    reclaim_ladder = reclaim_ladder or []
+    downside_targets = _ladder_prices(target_ladder, below=target_val, limit=3)
+    upside_targets = _ladder_prices(reclaim_ladder, above=target_val, limit=3)
+
     if direction == "SHORT":
-        pass_fail = "hold below it favors downside follow-through; reclaim above it weakens the short read"
+        follow_through = (
+            f" toward {downside_targets}"
+            if downside_targets else ""
+        )
+        reclaim_context = (
+            f" and puts {upside_targets} back in play"
+            if upside_targets else ""
+        )
+        pass_fail = (
+            f"hold below {level_txt} favors downside follow-through{follow_through}; "
+            f"reclaim above {level_txt} weakens the short read{reclaim_context}"
+        )
     else:
-        pass_fail = "hold above it favors continuation; rejection below it favors a fade back into the range"
+        upside_targets = _ladder_prices(target_ladder, above=target_val, limit=3)
+        downside_targets = _ladder_prices(reclaim_ladder, below=target_val, limit=3)
+        continuation = (
+            f" toward {upside_targets}"
+            if upside_targets else ""
+        )
+        rejection_context = (
+            f" and puts {downside_targets} back in play"
+            if downside_targets else ""
+        )
+        pass_fail = (
+            f"hold above {level_txt} favors continuation{continuation}; "
+            f"rejection below {level_txt} favors a fade back into the range{rejection_context}"
+        )
 
     zone_txt = ""
     if earn_zone and weekly_zone:
@@ -1723,6 +1807,12 @@ def _fib_target_fields(ticker: str, daily_df: pd.DataFrame, price: float,
     last_earnings = swing.get("last_earnings")
     rounded_tgt = _round2(tgt_val) if tgt_val is not None else None
     rounded_reward = _round2(target_reward_pct) if target_reward_pct is not None else None
+    target_ladder = _fib_target_ladder(levels, price, direction)
+    reclaim_ladder = _fib_target_ladder(
+        levels,
+        rounded_tgt or price,
+        "LONG" if direction == "SHORT" else "SHORT",
+    )
 
     out.update({
         "earn_zone": earn_zone,
@@ -1733,6 +1823,8 @@ def _fib_target_fields(ticker: str, daily_df: pd.DataFrame, price: float,
         "fib_target": rounded_tgt,
         "fib_target_name": tgt_name,
         "fib_target_reward_pct": rounded_reward,
+        "fib_target_ladder": target_ladder,
+        "fib_reclaim_ladder": reclaim_ladder,
         "fib_target_source": swing["source"],
         "fib_swing_low": _round2(lo),
         "fib_swing_high": _round2(hi),
@@ -1755,6 +1847,8 @@ def _fib_target_fields(ticker: str, daily_df: pd.DataFrame, price: float,
         prev_earnings=prev_earnings,
         last_earnings=last_earnings,
         next_earnings=next_earnings,
+        target_ladder=target_ladder,
+        reclaim_ladder=reclaim_ladder,
     )
     return out
 
@@ -2161,6 +2255,17 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
             "entry":        trade.get("entry"),
             "stop_loss":    trade.get("stop_loss"),
             "target1":      trade.get("target1"),
+            "target2":      trade.get("target2"),
+            "t1_days":      trade.get("t1_days"),
+            "t1_days_min":  trade.get("t1_days_min"),
+            "t1_days_max":  trade.get("t1_days_max"),
+            "t1_days_text": trade.get("t1_days_text"),
+            "t1_days_basis": trade.get("t1_days_basis"),
+            "t2_days":      trade.get("t2_days"),
+            "t2_days_min":  trade.get("t2_days_min"),
+            "t2_days_max":  trade.get("t2_days_max"),
+            "t2_days_text": trade.get("t2_days_text"),
+            "t2_days_basis": trade.get("t2_days_basis"),
             "risk_pct":     trade.get("risk_pct"),
             "rr_t1":        trade.get("rr_t1"),
             "atr":          trade.get("atr"),

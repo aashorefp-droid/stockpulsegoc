@@ -459,6 +459,135 @@ def get_entry_grade(score: int, confidence: str) -> dict:
 
 # ── Entry / Stop / Target levels ──────────────────────────────────────────────
 
+def _duration_day(value: Optional[float], *, cap: int = 30) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(v) or v <= 0:
+        return None
+    return int(max(1, min(cap, round(v))))
+
+
+def _duration_text(lo: Optional[int], mid: Optional[int], hi: Optional[int], *,
+                   extended: bool = False) -> Optional[str]:
+    if mid is None:
+        return None
+    suffix = "+" if extended else ""
+    if lo is None or hi is None or lo == hi:
+        return f"~{mid}d{suffix}"
+    return f"~{lo}-{hi}d{suffix}"
+
+
+def _estimate_target_duration(
+    daily_df: pd.DataFrame,
+    entry: float,
+    target: Optional[float],
+    direction: str,
+    atr: float,
+) -> dict:
+    """Approximate trading days to target from recent same-size hit history."""
+    empty = {
+        "days": None, "days_min": None, "days_max": None,
+        "days_text": None, "days_basis": None,
+    }
+    if target is None or entry <= 0 or atr <= 0:
+        return empty
+
+    distance = abs(float(target) - float(entry))
+    if distance <= 0:
+        return empty
+
+    target_pct = distance / entry
+    horizon = 30
+    lookback = 160
+
+    try:
+        hc = _col(daily_df, "high")
+        lc = _col(daily_df, "low")
+        cc = _col(daily_df, "close")
+        hist = daily_df[[hc, lc, cc]].dropna().tail(lookback + horizon + 1)
+        if len(hist) >= horizon + 20:
+            highs = hist[hc].astype(float).to_numpy()
+            lows = hist[lc].astype(float).to_numpy()
+            closes = hist[cc].astype(float).to_numpy()
+            hit_samples: list[int] = []
+            total_samples = 0
+            hits = 0
+            max_start = len(hist) - horizon - 1
+            start_min = max(0, max_start - lookback)
+
+            for i in range(start_min, max_start + 1):
+                base = closes[i]
+                if not np.isfinite(base) or base <= 0:
+                    continue
+                total_samples += 1
+                threshold = (
+                    base * (1 + target_pct)
+                    if direction == "LONG"
+                    else base * (1 - target_pct)
+                )
+                hit_days = None
+                for j in range(i + 1, min(i + horizon + 1, len(hist))):
+                    if direction == "LONG" and highs[j] >= threshold:
+                        hit_days = j - i
+                        break
+                    if direction == "SHORT" and lows[j] <= threshold:
+                        hit_days = j - i
+                        break
+                if hit_days is not None:
+                    hit_samples.append(hit_days)
+                    hits += 1
+
+            if total_samples >= 12 and len(hit_samples) >= 4:
+                arr = np.array(hit_samples, dtype=float)
+                lo = _duration_day(float(np.percentile(arr, 25)), cap=horizon)
+                mid = _duration_day(float(np.percentile(arr, 50)), cap=horizon)
+                hi = _duration_day(float(np.percentile(arr, 75)), cap=horizon)
+                if lo is not None and mid is not None:
+                    lo = min(lo, mid)
+                if hi is not None and mid is not None:
+                    hi = max(hi, mid)
+                hit_rate = hits / total_samples if total_samples else 0
+                reliability = (
+                    "low reliability"
+                    if hit_rate < 0.35
+                    else "moderate reliability"
+                    if hit_rate < 0.60
+                    else "good reliability"
+                )
+                return {
+                    "days": mid,
+                    "days_min": lo,
+                    "days_max": hi,
+                    "days_text": _duration_text(lo, mid, hi),
+                    "days_basis": (
+                        f"Recent history: {hits}/{total_samples} same-size "
+                        f"{direction.lower()} targets hit within {horizon} trading days; "
+                        f"ETA range uses successful hits only ({reliability})"
+                    ),
+                }
+    except Exception:
+        pass
+
+    fast = _duration_day(distance / (atr * 0.80), cap=horizon)
+    mid = _duration_day(distance / (atr * 0.50), cap=horizon)
+    slow = _duration_day(distance / (atr * 0.30), cap=horizon)
+    if fast is not None and mid is not None:
+        fast = min(fast, mid)
+    if slow is not None and mid is not None:
+        slow = max(slow, mid)
+    return {
+        "days": mid,
+        "days_min": fast,
+        "days_max": slow,
+        "days_text": _duration_text(fast, mid, slow),
+        "days_basis": "ATR fallback: target distance divided by 30-80% of ATR(14)",
+    }
+
+
 def calc_trade_levels(daily_df: pd.DataFrame, verdict: str, current_price: float) -> dict:
     atr = calc_atr(daily_df)
     close_col = _col(daily_df, "close")
@@ -472,42 +601,55 @@ def calc_trade_levels(daily_df: pd.DataFrame, verdict: str, current_price: float
 
     recent_lo = float(daily_df[lo_col].iloc[-10:].min())
     recent_hi = float(daily_df[hi_col].iloc[-10:].max())
-    avg_daily_move = atr * 0.6
 
     entry = round(current_price, 2)
 
     if verdict in ("BULLISH", "LEAN BULLISH"):
+        direction = "LONG"
         stop   = round(recent_lo - atr * atr_mult, 2)
         risk   = entry - stop
         t1     = round(entry + risk * 2, 2)
         t2     = round(entry + risk * 3, 2)
         rr1    = round((t1 - entry) / risk, 2) if risk > 0 else 0
         rr2    = round((t2 - entry) / risk, 2) if risk > 0 else 0
-        t1_days = max(1, round((t1 - entry) / avg_daily_move)) if avg_daily_move > 0 else None
-        t2_days = max(1, round((t2 - entry) / avg_daily_move)) if avg_daily_move > 0 else None
         swing_invalid = round(recent_lo, 2)
         swing_invalid_text = f"Close < ${swing_invalid:.2f} (10-bar low)"
     elif verdict in ("BEARISH", "LEAN BEARISH"):
+        direction = "SHORT"
         stop   = round(recent_hi + atr * atr_mult, 2)
         risk   = stop - entry
         t1     = round(entry - risk * 2, 2)
         t2     = round(entry - risk * 3, 2)
         rr1    = round((entry - t1) / risk, 2) if risk > 0 else 0
         rr2    = round((entry - t2) / risk, 2) if risk > 0 else 0
-        t1_days = max(1, round((entry - t1) / avg_daily_move)) if avg_daily_move > 0 else None
-        t2_days = max(1, round((entry - t2) / avg_daily_move)) if avg_daily_move > 0 else None
         swing_invalid = round(recent_hi, 2)
         swing_invalid_text = f"Close > ${swing_invalid:.2f} (10-bar high)"
     else:
         return {"entry": entry, "stop_loss": None, "target1": None, "target2": None,
                 "risk_pct": None, "rr_t1": None, "rr_t2": None,
-                "t1_days": None, "t2_days": None, "atr": round(atr, 2),
+                "t1_days": None, "t1_days_min": None, "t1_days_max": None,
+                "t1_days_text": None, "t1_days_basis": None,
+                "t2_days": None, "t2_days_min": None, "t2_days_max": None,
+                "t2_days_text": None, "t2_days_basis": None,
+                "atr": round(atr, 2),
                 "swing_invalidation": None, "swing_invalidation_text": None}
 
+    t1_eta = _estimate_target_duration(daily_df, entry, t1, direction, atr)
+    t2_eta = _estimate_target_duration(daily_df, entry, t2, direction, atr)
     risk_pct = round(abs(risk / entry) * 100, 2) if entry > 0 else None
     return {"entry": entry, "stop_loss": stop, "target1": t1, "target2": t2,
             "risk_pct": risk_pct, "rr_t1": rr1, "rr_t2": rr2,
-            "t1_days": t1_days, "t2_days": t2_days, "atr": round(atr, 2),
+            "t1_days": t1_eta["days"],
+            "t1_days_min": t1_eta["days_min"],
+            "t1_days_max": t1_eta["days_max"],
+            "t1_days_text": t1_eta["days_text"],
+            "t1_days_basis": t1_eta["days_basis"],
+            "t2_days": t2_eta["days"],
+            "t2_days_min": t2_eta["days_min"],
+            "t2_days_max": t2_eta["days_max"],
+            "t2_days_text": t2_eta["days_text"],
+            "t2_days_basis": t2_eta["days_basis"],
+            "atr": round(atr, 2),
             "swing_invalidation": swing_invalid,
             "swing_invalidation_text": swing_invalid_text}
 
