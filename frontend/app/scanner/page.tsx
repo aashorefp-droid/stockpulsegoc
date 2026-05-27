@@ -280,6 +280,7 @@ interface ScanResult {
   btd_zone?:      string | null;
   btd_reason?:    string | null;
   btd_size?:      string | null;
+  ema11?:         number | null;
   ema20?:         number | null;
   ema50?:         number | null;
   ema200?:        number | null;
@@ -2484,6 +2485,17 @@ export default function ScannerPage() {
                               </>
                             )}
                           </div>
+                          {(r.ema11 != null || r.ema20 != null || r.ema50 != null || r.ema200 != null) && (
+                            <div
+                              className="mt-1 grid grid-cols-[44px_86px] gap-x-1 gap-y-0.5 border-t border-border/20 pt-1 text-[10px] font-mono"
+                              title="Visible swing EMAs: 11 / 20 / 50 / 200"
+                            >
+                              <span className="text-muted">EMA11</span><span className="text-right text-accent">{fmtMoney(r.ema11)}</span>
+                              <span className="text-muted">EMA20</span><span className="text-right text-accent">{fmtMoney(r.ema20)}</span>
+                              <span className="text-muted">EMA50</span><span className="text-right text-yellow">{fmtMoney(r.ema50)}</span>
+                              <span className="text-muted">EMA200</span><span className="text-right text-white">{fmtMoney(r.ema200)}</span>
+                            </div>
+                          )}
                           {(r.prev_week_high != null || r.prev_month_high != null || r.wk52_high != null) && (
                             <div
                               className="grid grid-cols-[42px_96px] gap-x-1 gap-y-0.5 border-t border-border/20 pt-1 mt-1 text-[10px] font-mono"
@@ -2557,7 +2569,7 @@ export default function ScannerPage() {
                                 onDoubleClick={() => r.btd_state && r.btd_state !== "N/A" && setBtdModal({ r })}
                                 title={[
                                   r.btd_reason,
-                                  r.ema20 != null && `EMA 20/50/200: ${r.ema20} / ${r.ema50} / ${r.ema200}`,
+                                  r.ema11 != null && `EMA 11/20/50/200: ${r.ema11} / ${r.ema20} / ${r.ema50} / ${r.ema200}`,
                                   r.ema50_slope_pct != null && `50EMA slope ${r.ema50_slope_pct > 0 ? "+" : ""}${r.ema50_slope_pct}%`,
                                   "Double-click for detail + copy",
                                 ].filter(Boolean).join("  ·  ")}
@@ -3095,6 +3107,7 @@ export default function ScannerPage() {
           r.btd_reason ? `Reason:  ${r.btd_reason}` : null,
           ``,
           `Price:   $${r.price?.toFixed(2) ?? "—"}`,
+          `EMA 11:  ${r.ema11 ?? "—"}`,
           `EMA 20:  ${r.ema20 ?? "—"}`,
           `EMA 50:  ${r.ema50 ?? "—"}   (slope ${r.ema50_slope_pct != null ? `${r.ema50_slope_pct > 0 ? "+" : ""}${r.ema50_slope_pct}%` : "—"})`,
           `EMA 200: ${r.ema200 ?? "—"}`,

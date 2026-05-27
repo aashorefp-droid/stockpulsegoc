@@ -846,7 +846,7 @@ def compute_btd(daily_df: pd.DataFrame, regime_ok: bool = True) -> dict:
     out = {
         "btd_state": "N/A", "btd_zone": None, "btd_reason": None,
         "btd_size": None,
-        "ema20": None, "ema50": None, "ema200": None, "ema50_slope_pct": None,
+        "ema11": None, "ema20": None, "ema50": None, "ema200": None, "ema50_slope_pct": None,
     }
     try:
         if daily_df is None or daily_df.empty:
@@ -858,11 +858,13 @@ def compute_btd(daily_df: pd.DataFrame, regime_ok: bool = True) -> dict:
             out["btd_reason"] = "insufficient history"
             return out
 
+        ema11s  = _ema(close, 11)
         ema20s  = _ema(close, 20)
         ema50s  = _ema(close, 50)
         ema200s = _ema(close, 200) if n >= 200 else None
 
         c   = float(close.iloc[-1])
+        e11 = float(ema11s.iloc[-1])
         e20 = float(ema20s.iloc[-1])
         e50 = float(ema50s.iloc[-1])
         e200 = float(ema200s.iloc[-1]) if ema200s is not None else None
@@ -873,6 +875,7 @@ def compute_btd(daily_df: pd.DataFrame, regime_ok: bool = True) -> dict:
         e50_rising = e50_slope >= -0.002  # flat-or-up tolerance
 
         out.update({
+            "ema11": round(e11, 2),
             "ema20": round(e20, 2),
             "ema50": round(e50, 2),
             "ema200": round(e200, 2) if e200 is not None else None,
