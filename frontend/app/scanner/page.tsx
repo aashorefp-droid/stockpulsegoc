@@ -19,7 +19,7 @@ const WATCHLISTS = [
   { key: "custom",        label: "Custom",            count: 0   },
 ];
 
-type Filter = "all" | "actionable" | "rank1" | "exceptional" | "high_short" | "day_spring" | "lt_spring" | "sweep_reclaim_long" | "sweep_reclaim_short" | "breakout" | "quality_long" | "btd" | "btd_trigger" | "speculative" | "news_good" | "news_bad";
+type Filter = "all" | "actionable" | "rank1" | "exceptional" | "high_short" | "day_spring" | "lt_spring" | "sweep_reclaim_long" | "sweep_reclaim_short" | "breakout" | "prebreakout" | "quality_long" | "btd" | "btd_trigger" | "speculative" | "news_good" | "news_bad";
 
 const isBtdLive = (s?: string) => s === "TRIGGER" || s === "ARMED" || s === "ARMED-DEEP";
 type SortBy = "score" | "grade" | "rr" | "swingReward" | "fibReward" | "dayReward" | "ltEntryPct" | "valuation" | "longRunway" | "cyclicalPeak" | "multiBagger" | "newsGood" | "newsBad";
@@ -1279,6 +1279,7 @@ export default function ScannerPage() {
       case "sweep_reclaim_long":  return isSweepReclaimLong(r);
       case "sweep_reclaim_short": return isSweepReclaimShort(r);
       case "breakout":            return isBreakout(r);
+      case "prebreakout":         return !!r.swing_prebreakout;
       case "quality_long":
         return r.lre_score === 3
           && (r.verdict === "BULLISH" || r.verdict === "LEAN BULLISH")
@@ -1983,7 +1984,7 @@ export default function ScannerPage() {
             className="flex flex-wrap gap-1 bg-card border border-border rounded-lg p-1"
             title="Click a chip to toggle it. Stack multiple chips for an OR-match. Click All (or right-click any chip) to reset."
           >
-            {(["all", "actionable", "rank1", "exceptional", "high_short", "btd", "btd_trigger", "day_spring", "lt_spring", "sweep_reclaim_long", "sweep_reclaim_short", "breakout", "quality_long", "speculative", "news_good", "news_bad"] as Filter[]).map(f => {
+            {(["all", "actionable", "rank1", "exceptional", "high_short", "btd", "btd_trigger", "day_spring", "lt_spring", "sweep_reclaim_long", "sweep_reclaim_short", "breakout", "prebreakout", "quality_long", "speculative", "news_good", "news_bad"] as Filter[]).map(f => {
               const active = f === "all" ? filters.size === 0 : filters.has(f);
               return (
               <button key={f}
@@ -1995,6 +1996,7 @@ export default function ScannerPage() {
                 {f === "sweep_reclaim_long" ? `Sweep Reclaim Long (${results.filter(isSweepReclaimLong).length})`
                 : f === "sweep_reclaim_short" ? `Sweep Reclaim Short (${results.filter(isSweepReclaimShort).length})`
                 : f === "breakout"   ? `🚀 Breakout (${results.filter(isBreakout).length})`
+                : f === "prebreakout" ? `PreBO (${results.filter(r => !!r.swing_prebreakout).length})`
                 : f === "all"         ? `All (${results.filter(r => !r.error).length})`
                 : f === "actionable" ? `🎯 Actionable (${results.filter(r => r.mtf_rank === 1 && (r.lre_status === "ACTIVE" || r.lre_status === "DISCOUNT")).length})`
                 : f === "rank1"      ? `Rank 1 (${results.filter(r => r.mtf_rank === 1).length})`
