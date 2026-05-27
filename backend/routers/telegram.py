@@ -54,7 +54,9 @@ def telegram_lightning_scan():
             "message": f"Scanned {scanned} Default + Momentum tickers; no lightning found",
         }
 
-    msg = _format_lightning_scan_summary(hits, scanned)
+    today = datetime.now(ZoneInfo("America/Chicago")).date().isoformat()
+    earnings_today = _same_day_earnings_tickers(hits, today)
+    msg = _format_lightning_scan_summary(hits, scanned, earnings_today, today)
     if not send_telegram(token, chat_id, msg):
         raise HTTPException(status_code=502, detail="Telegram send failed")
     return {
@@ -65,8 +67,14 @@ def telegram_lightning_scan():
     }
 
 
-def _format_lightning_scan_summary(hits: list[dict], scanned: int) -> str:
+def _format_lightning_scan_summary(
+    hits: list[dict],
+    scanned: int,
+    earnings_today: set[str] | None = None,
+    earnings_date: str | None = None,
+) -> str:
     now = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M CT")
+    earnings_today = earnings_today or set()
     lines = [
         f"⚡ <b>Default 50 + Momentum 20 lightning scan</b> · {len(hits)} found / {scanned} scanned",
         now,
@@ -76,6 +84,8 @@ def _format_lightning_scan_summary(hits: list[dict], scanned: int) -> str:
             f"<b>{str(r.get('ticker', '')).upper()}</b> "
             f"${float(r.get('price') or 0):.2f} · {r.get('verdict', '')} · {r.get('direction', '')}"
         )
+        if str(r.get("ticker", "")).upper() in earnings_today:
+            line += f"\n   <b>!! EARNINGS TODAY ({earnings_date}) !!</b> same-day earnings volume"
         if r.get("opt_strategy"):
             line += f"\n   Options: {r.get('opt_strategy')}"
             if r.get("opt_summary"):
@@ -95,6 +105,25 @@ def _format_lightning_scan_summary(hits: list[dict], scanned: int) -> str:
     if len(hits) > 12:
         lines.append(f"+{len(hits) - 12} more")
     return "\n\n".join(lines)
+
+
+def _same_day_earnings_tickers(hits: list[dict], today: str) -> set[str]:
+    tickers: set[str] = set()
+    try:
+        from backend.db.earnings_tracker import get_all_for_date
+        for row in get_all_for_date(today):
+            ticker = str(row.get("ticker") or "").upper().strip()
+            if ticker:
+                tickers.add(ticker)
+    except Exception:
+        pass
+
+    for row in hits:
+        ticker = str(row.get("ticker") or "").upper().strip()
+        next_earnings = str(row.get("next_earnings") or row.get("fib_next_earnings") or "").strip()
+        if ticker and next_earnings == today:
+            tickers.add(ticker)
+    return tickers
 
 
 def _config_value(*names: str) -> str:
