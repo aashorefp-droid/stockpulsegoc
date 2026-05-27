@@ -593,6 +593,58 @@ function fibDetailText(r: ScanResult): string {
   ].filter((v): v is string => typeof v === "string").join("\n");
 }
 
+function hasV4Plan(r: ScanResult): boolean {
+  return r.dt4_enabled !== false && !!r.dt4_setup && r.dt4_setup !== "disabled";
+}
+
+function dt4ScenarioText(r: ScanResult): string | null {
+  if (r.dt4_setup !== "range_wait") return null;
+  return [
+    `Long scenario: sweep below PDL ${fmtMoney(r.dt4_pdl)} or PWL ${fmtMoney(r.dt4_pwl)}; then 5m close back above the swept level + retest hold.`,
+    `Short scenario: sweep above PDH ${fmtMoney(r.dt4_pdh)} or PWH ${fmtMoney(r.dt4_pwh)}; then 5m close back below the swept level + failed retest.`,
+  ].join("\n");
+}
+
+function dt4DetailText(r: ScanResult): string {
+  const rangeWait = r.dt4_setup === "range_wait";
+  const scenario = dt4ScenarioText(r);
+  return [
+    `${r.ticker} - Day Trading V4`,
+    "",
+    `Price: ${fmtMoney(r.price)}`,
+    `Context: ${r.dt4_context ?? "-"}`,
+    `Setup: ${r.dt4_setup ? r.dt4_setup.replaceAll("_", " ") : "-"}`,
+    `Side: ${r.dt4_side ?? "-"}`,
+    `Bias: ${r.dt4_bias ?? "-"}`,
+    `Grade: ${r.dt4_grade ?? "-"}`,
+    "",
+    rangeWait
+      ? `Support: PDL ${fmtMoney(r.dt4_pdl)} / PWL ${fmtMoney(r.dt4_pwl)}`
+      : `Level: ${r.dt4_level ?? "-"} ${fmtMoney(r.dt4_level_val)}`,
+    rangeWait
+      ? `Resistance: PDH ${fmtMoney(r.dt4_pdh)} / PWH ${fmtMoney(r.dt4_pwh)}`
+      : `Watch/Entry: ${fmtMoney(r.dt4_entry)}`,
+    rangeWait ? "Entry: wait for reclaim/reject trigger" : `Stop: ${fmtMoney(r.dt4_stop)}`,
+    rangeWait ? "Risk: after trigger" : `T1: ${fmtMoney(r.dt4_t1)}`,
+    !rangeWait && r.dt4_t2 != null ? `T2: ${fmtMoney(r.dt4_t2)}` : null,
+    rangeWait ? "Target plan: VWAP/mid, then opposite edge" : `R/R: ${r.dt4_rr != null ? `${r.dt4_rr}x` : "-"}`,
+    "",
+    r.dt4_trigger ? `Trigger: ${r.dt4_trigger}` : null,
+    r.dt4_invalidation ? `Invalidation: ${r.dt4_invalidation}` : null,
+    r.dt4_target_plan ? `Target plan: ${r.dt4_target_plan}` : null,
+    r.dt4_exit_plan ? `Exit plan: ${r.dt4_exit_plan}` : null,
+    r.dt4_note ? `Note: ${r.dt4_note}` : null,
+    scenario ? "" : null,
+    scenario,
+    "",
+    `PDH: ${fmtMoney(r.dt4_pdh)}`,
+    `PDL: ${fmtMoney(r.dt4_pdl)}`,
+    `PWH: ${fmtMoney(r.dt4_pwh)}`,
+    `PWL: ${fmtMoney(r.dt4_pwl)}`,
+    `ATR: ${fmtMoney(r.dt4_atr)}`,
+  ].filter((v): v is string => typeof v === "string").join("\n");
+}
+
 function fmtEarnings(d?: string | null): { text: string; days: number | null; soon: boolean } | null {
   if (!d) return null;
   const dt = new Date(`${d}T00:00:00`);
@@ -683,6 +735,7 @@ export default function ScannerPage() {
   const [btdModal,     setBtdModal]     = useState<{ r: ScanResult } | null>(null);
   const [newsModal,    setNewsModal]    = useState<{ r: ScanResult } | null>(null);
   const [fibModal,     setFibModal]     = useState<{ r: ScanResult } | null>(null);
+  const [dt4Modal,     setDt4Modal]     = useState<{ r: ScanResult } | null>(null);
   const [seasonModal,  setSeasonModal]  = useState<
     { ticker: string; loading: boolean; data: Seasonality | null; error?: string } | null
   >(null);
@@ -739,6 +792,13 @@ export default function ScannerPage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [fibModal]);
+
+  useEffect(() => {
+    if (!dt4Modal) return;
+    function onKey(e: KeyboardEvent) { if (e.key === "Escape") setDt4Modal(null); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dt4Modal]);
 
   useEffect(() => {
     if (!seasonModal) return;
@@ -2508,7 +2568,7 @@ export default function ScannerPage() {
                                 {r.btd_zone && (
                                   <span className="text-[8px] text-muted/70 whitespace-normal max-w-[80px]">{r.btd_zone}</span>
                                 )}
-                                <span className="text-muted/40 text-[8px] opacity-0 group-hover:opacity-100 transition-opacity">⤢</span>
+                                <span className="text-muted/40 text-[8px]">⤢</span>
                               </div>
                             );
                           })()}
@@ -2611,7 +2671,7 @@ export default function ScannerPage() {
                                   {r.fib_target_source}
                                 </span>
                               )}
-                              <span className="rounded border border-green/30 bg-green/10 px-1 py-0.5 text-[9px] text-green sm:opacity-0 sm:group-hover:opacity-100">
+                              <span className="rounded border border-green/30 bg-green/10 px-1 py-0.5 text-[9px] text-green">
                                 Details
                               </span>
                             </div>
@@ -2653,17 +2713,20 @@ export default function ScannerPage() {
                                 </div>
                               </div>
                             )}
-                            {r.dt4_enabled !== false && r.dt4_setup && r.dt4_setup !== "disabled" && (
+                            {hasV4Plan(r) && (
                               <div
-                                className="mt-1 border-t border-border/30 pt-1"
-                                title={[
-                                  r.dt4_note,
-                                  r.dt4_setup === "range_wait"
-                                    ? `1. Long scenario: let price sweep below PDL ${fmtMoney(r.dt4_pdl)} or PWL ${fmtMoney(r.dt4_pwl)} first; then wait for a 5m close back above the swept level and a retest hold. 2. Short scenario: let price sweep above PDH ${fmtMoney(r.dt4_pdh)} or PWH ${fmtMoney(r.dt4_pwh)} first; then wait for a 5m close back below the swept level and a failed retest.`
-                                    : null,
-                                  r.dt4_exit_plan,
-                                  r.dt4_target_plan,
-                                ].filter(Boolean).join(" | ") || undefined}
+                                className="group mt-1 cursor-pointer border-t border-border/30 pt-1 focus:outline-none focus:ring-1 focus:ring-yellow/40"
+                                role="button"
+                                tabIndex={0}
+                                aria-label={`${r.ticker} Day Trading V4 details`}
+                                onClick={() => setDt4Modal({ r })}
+                                onKeyDown={e => {
+                                  if (e.key === "Enter" || e.key === " ") {
+                                    e.preventDefault();
+                                    setDt4Modal({ r });
+                                  }
+                                }}
+                                title={dt4DetailText(r)}
                               >
                                 <div className="grid grid-cols-[34px_96px] gap-x-1 gap-y-0.5">
                                   <span className="text-yellow">V4</span>
@@ -2715,6 +2778,11 @@ export default function ScannerPage() {
                                   <span className="text-right text-accent whitespace-normal">{r.dt4_trigger ?? "-"}</span>
                                   <span className="text-muted">Inv</span>
                                   <span className="text-right text-red whitespace-normal">{r.dt4_invalidation ?? "-"}</span>
+                                </div>
+                                <div className="mt-1 flex justify-end">
+                                  <span className="rounded border border-yellow/30 bg-yellow/10 px-1 py-0.5 text-[9px] text-yellow">
+                                    Details
+                                  </span>
                                 </div>
                               </div>
                             )}
@@ -2854,7 +2922,7 @@ export default function ScannerPage() {
                                 <span className="text-yellow ml-1">Fly</span>
                               )}
                             </span>
-                            <span className="text-muted/40 text-[10px] opacity-0 group-hover:opacity-100 transition-opacity">⤢</span>
+                            <span className="text-muted/40 text-[10px]">⤢</span>
                           </span>
                         ) : (
                           <span className="text-muted text-xs">—</span>
@@ -2928,7 +2996,7 @@ export default function ScannerPage() {
                                     </span>
                                   );
                                 })}
-                                <span className="text-muted/40 text-[9px] opacity-0 group-hover:opacity-100 transition-opacity">⤢ details</span>
+                                <span className="text-muted/40 text-[9px]">⤢ details</span>
                               </span>
                             ) : (
                               <span className="text-muted text-xs">—</span>
@@ -3165,6 +3233,45 @@ export default function ScannerPage() {
                 </button>
                 <button
                   onClick={() => setFibModal(null)}
+                  className="px-4 py-1.5 text-xs font-semibold rounded-lg border border-border text-muted hover:text-white transition-colors"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Day Trading V4 detail modal (tap the V4 block) */}
+      {dt4Modal && (() => {
+        const r = dt4Modal.r;
+        const text = dt4DetailText(r);
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+            onClick={() => setDt4Modal(null)}
+          >
+            <div
+              className="bg-card border border-border rounded-xl shadow-2xl p-5 w-full max-w-lg mx-4 space-y-3"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-white">{r.ticker} - Day Trading V4</span>
+                <button onClick={() => setDt4Modal(null)} className="text-muted hover:text-white text-lg leading-none">x</button>
+              </div>
+              <div className="max-h-[60vh] overflow-y-auto whitespace-pre-wrap rounded-lg border border-border bg-surface p-3 font-mono text-sm text-white">
+                {text}
+              </div>
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={() => copyText(text)}
+                  className="px-4 py-1.5 text-xs font-semibold rounded-lg bg-accent text-black hover:bg-accent/80 transition-colors"
+                >
+                  {copied ? "Copied" : "Copy"}
+                </button>
+                <button
+                  onClick={() => setDt4Modal(null)}
                   className="px-4 py-1.5 text-xs font-semibold rounded-lg border border-border text-muted hover:text-white transition-colors"
                 >
                   Close
