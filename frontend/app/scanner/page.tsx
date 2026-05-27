@@ -243,6 +243,15 @@ interface ScanResult {
   lre_takeaway?:  string;
   vol_surge?:    boolean;
   breakout_score?: number;
+  swing_prebreakout?: boolean;
+  swing_prebreakout_score?: number | null;
+  swing_prebreakout_level?: number | null;
+  swing_prebreakout_dist_pct?: number | null;
+  swing_prebreakout_trigger?: string | null;
+  swing_prebreakout_invalidation?: string | null;
+  swing_prebreakout_reason?: string | null;
+  btd_trigger?: boolean;
+  btd_trigger_text?: string | null;
   dist_from_high?: number;
   entry?:        number;
   stop_loss?:    number;
@@ -2034,6 +2043,7 @@ export default function ScannerPage() {
                 "Verdict Flip Date","Verdict Flip From","Days Since Flip",
                 "Long Term Entry Range","Long Term % From Entry","Long Term Risk%","Long Term Spring","Valuation","Valuation Fair Value","Valuation Upside%","Valuation Source","Valuation Reason",
                 "Swing Entry","Swing Stop","Swing T1","Swing T1 Approx Days","Swing Reward%","Swing Risk%","Swing R/R","Swing Invalidation","Swing Spring",
+                "Swing Pre-Breakout","Pre-Breakout Level","Pre-Breakout Distance%","Pre-Breakout Trigger","Pre-Breakout Reason","BTD Trigger",
                 "Fib Target","Fib Reward%","Fib Level","Fib Source","Fib Commentary","Prev Earnings","Last Earnings","Next Earnings (Fib)","Earn Zone","Weekly Zone","Nearest Fib","Fib Compression",
                 "News","Next Earnings",
                 "Day Trading Result","Day Trading Entry","Day Trading Stop","Day Trading T1","Day Trading Reward%","Day Trading Spring","Day Trading Trigger","Day Trading Invalidation","Day Trading Target Plan","Day Trading Volume Confirm","Day Trading 15m Volume Confirm","Day Trading Ref",
@@ -2051,6 +2061,7 @@ export default function ScannerPage() {
                   lreRangeText(r), lreFromEntry, r.lre_risk_pct, r.long_term_spring_text,
                   r.valuation_label, valuationFairValue(r), valuationUpsidePct(r), r.valuation_source, r.valuation_reason,
                   r.entry, r.stop_loss, r.target1, r.t1_days_text ?? r.t1_days ?? "", rewardPct(r.entry, r.target1), r.risk_pct, r.rr_t1, r.swing_invalidation_text, r.swing_spring_text,
+                  r.swing_prebreakout ? "Y" : "", r.swing_prebreakout_level, r.swing_prebreakout_dist_pct, r.swing_prebreakout_trigger, r.swing_prebreakout_reason, r.btd_trigger ? (r.btd_trigger_text || "Y") : "",
                   r.fib_target, r.fib_target_reward_pct != null ? `${r.fib_target_reward_pct.toFixed(2)}%` : "",
                   r.fib_target_name, r.fib_target_source, r.fib_commentary,
                   r.fib_prev_earnings, r.fib_last_earnings, r.fib_next_earnings,
@@ -2462,6 +2473,35 @@ export default function ScannerPage() {
                               <span className="font-semibold text-white">{r.ticker}</span>
                               {r.verdict ? `, ${r.verdict}` : ""}, {r.lre_takeaway}
                             </span>
+                          )}
+                          {r.swing_prebreakout && (
+                            <div
+                              className="grid grid-cols-[44px_96px] gap-x-1 gap-y-0.5 rounded border border-yellow/20 bg-yellow/5 p-1 text-[10px] font-mono"
+                              title={[
+                                r.swing_prebreakout_trigger,
+                                r.swing_prebreakout_invalidation,
+                                r.swing_prebreakout_reason,
+                              ].filter(Boolean).join(" | ") || undefined}
+                            >
+                              <span className="text-yellow">PreBO</span>
+                              <span className="text-right text-yellow">
+                                {r.swing_prebreakout_dist_pct != null ? `${r.swing_prebreakout_dist_pct}%` : "-"} under
+                              </span>
+                              <span className="text-muted">Break</span>
+                              <span className="text-right text-accent">{fmtMoney(r.swing_prebreakout_level)}</span>
+                              <span className="text-muted">Score</span>
+                              <span className="text-right text-white">{r.swing_prebreakout_score ?? "-"}</span>
+                              <span className="text-muted">Why</span>
+                              <span className="text-right text-muted/80 whitespace-normal">{r.swing_prebreakout_reason ?? "-"}</span>
+                            </div>
+                          )}
+                          {r.btd_trigger && (
+                            <div
+                              className="mt-1 rounded border border-green/20 bg-green/5 px-1 py-0.5 text-[10px] font-mono text-green"
+                              title={r.btd_trigger_text || undefined}
+                            >
+                              BTD Trigger{r.btd_trigger_text ? `: ${r.btd_trigger_text}` : ""}
+                            </div>
                           )}
                           <div className="grid grid-cols-[44px_64px] gap-x-1 gap-y-0.5">
                             <span className="text-muted">Entry</span><span className="text-right text-accent">{fmtMoney(r.entry)}</span>
