@@ -12,7 +12,8 @@ from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from backend.services.scanner import (
-    WATCHLISTS, scan_single, get_short_squeeze_tickers, get_telegram_watchlist,
+    WATCHLISTS, SWING_UNIVERSE_PRESETS, scan_single, get_short_squeeze_tickers,
+    get_swing_universe_tickers, get_telegram_watchlist,
 )
 
 router = APIRouter(prefix="/api/scanner", tags=["scanner"])
@@ -20,7 +21,9 @@ router = APIRouter(prefix="/api/scanner", tags=["scanner"])
 
 @router.get("/watchlists")
 def get_watchlists():
-    return {k: len(v) for k, v in WATCHLISTS.items()}
+    out = {k: len(v) for k, v in WATCHLISTS.items()}
+    out.update({k: int(v.get("limit", 0)) for k, v in SWING_UNIVERSE_PRESETS.items()})
+    return out
 
 
 @router.post("/v3-refresh")
@@ -241,6 +244,9 @@ async def stream_scan(
     elif watchlist == "telegram":
         loop = asyncio.get_event_loop()
         ticker_list = await loop.run_in_executor(None, get_telegram_watchlist)
+    elif watchlist in SWING_UNIVERSE_PRESETS:
+        loop = asyncio.get_event_loop()
+        ticker_list = await loop.run_in_executor(None, get_swing_universe_tickers, watchlist)
     else:
         ticker_list = WATCHLISTS.get(watchlist, WATCHLISTS["default"])
     tickers = ticker_list

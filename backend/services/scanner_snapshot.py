@@ -44,10 +44,17 @@ def retention_days() -> int:
 
 
 def _tickers_for_watchlist(watchlist: str) -> list[str]:
-    from backend.services.scanner import WATCHLISTS
+    from backend.services.scanner import (
+        WATCHLISTS,
+        SWING_UNIVERSE_PRESETS,
+        get_swing_universe_tickers,
+    )
 
     key = (watchlist or "").strip().lower()
-    tickers = WATCHLISTS.get(key, [])
+    if key in SWING_UNIVERSE_PRESETS:
+        tickers = get_swing_universe_tickers(key)
+    else:
+        tickers = WATCHLISTS.get(key, [])
     seen: set[str] = set()
     out: list[str] = []
     for ticker in tickers:

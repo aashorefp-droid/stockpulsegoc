@@ -1134,7 +1134,10 @@ export default function ScannerPage() {
       const data: ScanResult = JSON.parse(e.data);
       if (data.done) {
         setScanning(false);
-        setProgress(p => ({ ...p, done: data.total ?? p.done }));
+        setProgress(p => {
+          const total = data.total ?? p.done;
+          return { done: total, total: total || p.total };
+        });
         setSnapshotStatus("");
         setScannerCollapsed(true);
         es.close();

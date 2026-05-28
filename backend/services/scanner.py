@@ -5,6 +5,8 @@ Designed to be called in parallel from the scanner router.
 import logging
 import os
 import requests
+import sys
+import time
 import yfinance as yf
 import pandas as pd
 from datetime import date, timedelta
@@ -114,7 +116,7 @@ from backend.services.analysis import (
     mtf_signal_action, calc_atr, calc_weekly_atr, compute_seasonality,
     get_fundamentals, compute_btd, compute_w30, _col,
 )
-from backend.services.market_data import get_daily_bars_alpaca, get_five_min_bars_alpaca
+from backend.services.market_data import alpaca_get, get_daily_bars_alpaca, get_five_min_bars_alpaca
 from backend.services.options import get_options_strategy, get_options_bias
 from backend.config import ALPACA_API_KEY, ALPACA_API_SECRET
 
@@ -225,6 +227,153 @@ WATCHLISTS: dict[str, list[str]] = _WatchlistsDict({
         "GME", "AMC", "BBBY", "KOSS", "EXPR",
     ],
 })
+
+SWING_UNIVERSE_PRESETS: dict[str, dict] = {
+    "nyse_swing": {"exchange": "NYSE", "min_price": 10.0, "min_volume": 500_000, "limit": 200},
+    "nasdaq_swing": {"exchange": "NASDAQ", "min_price": 10.0, "min_volume": 500_000, "limit": 200},
+}
+_SWING_UNIVERSE_CACHE: dict[str, tuple[float, list[str]]] = {}
+
+
+def _plain_stock_symbol(symbol: str) -> bool:
+    return bool(symbol) and symbol.isalpha()
+
+
+def _dedupe_symbols(symbols: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in symbols:
+        sym = str(raw or "").strip().upper()
+        if sym and sym not in seen and _plain_stock_symbol(sym):
+            seen.add(sym)
+            out.append(sym)
+    return out
+
+
+def _alpaca_asset_symbols(exchange: str) -> list[str]:
+    if not (ALPACA_API_KEY and ALPACA_API_SECRET):
+        return []
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+    }
+    params = {"status": "active", "asset_class": "us_equity"}
+    if exchange:
+        params["exchange"] = exchange
+    r = requests.get("https://api.alpaca.markets/v2/assets", params=params, headers=headers, timeout=20)
+    r.raise_for_status()
+    assets = r.json() or []
+    symbols = [
+        a.get("symbol", "")
+        for a in assets
+        if a.get("tradable") and a.get("status") == "active"
+    ]
+    return _dedupe_symbols(symbols)
+
+
+def _alpaca_ranked_swing_universe(exchange: str, min_price: float, min_volume: int, limit: int) -> list[str]:
+    symbols = _alpaca_asset_symbols(exchange)
+    if not symbols:
+        return []
+    ranked: list[tuple[int, str]] = []
+    for start in range(0, len(symbols), 100):
+        batch = symbols[start:start + 100]
+        try:
+            data = alpaca_get(
+                "/v2/stocks/snapshots",
+                {"symbols": ",".join(batch), "feed": "iex"},
+                ALPACA_API_KEY,
+                ALPACA_API_SECRET,
+            )
+        except Exception:
+            continue
+        snaps = data.get("snapshots") or {}
+        for sym, snap in snaps.items():
+            daily = snap.get("dailyBar") or {}
+            trade = snap.get("latestTrade") or {}
+            price = trade.get("p") or daily.get("c") or 0
+            volume = daily.get("v") or 0
+            try:
+                if float(price) >= min_price and int(volume) >= min_volume:
+                    ranked.append((int(volume), str(sym).upper()))
+            except Exception:
+                continue
+    ranked.sort(reverse=True)
+    return _dedupe_symbols([sym for _, sym in ranked])[:limit]
+
+
+def _yahoo_ranked_swing_universe(exchange: str, min_price: float, min_volume: int, limit: int) -> list[str]:
+    exchange_codes = {
+        "NYSE": {"NYQ"},
+        "NASDAQ": {"NMS", "NGM", "NCM", "NAS"},
+    }.get(exchange.upper(), set())
+    headers = {"User-Agent": "Mozilla/5.0"}
+    tickers: list[str] = []
+    for offset in range(0, 1000, 250):
+        body = {
+            "offset": offset,
+            "size": 250,
+            "sortField": "regularMarketVolume",
+            "sortType": "DESC",
+            "quoteType": "EQUITY",
+            "query": {
+                "operator": "AND",
+                "operands": [
+                    {"operator": "EQ", "operands": ["region", "us"]},
+                    {"operator": "GT", "operands": ["regularMarketPrice", min_price]},
+                    {"operator": "GT", "operands": ["regularMarketVolume", min_volume]},
+                ],
+            },
+            "userId": "",
+            "userIdType": "guid",
+        }
+        try:
+            r = requests.post("https://query1.finance.yahoo.com/v1/finance/screener", json=body, headers=headers, timeout=15)
+            r.raise_for_status()
+            quotes = (r.json().get("finance", {}).get("result") or [{}])[0].get("quotes") or []
+        except Exception:
+            break
+        if not quotes:
+            break
+        for q in quotes:
+            sym = str(q.get("symbol") or "").upper()
+            exch = str(q.get("exchange") or "").upper()
+            if exchange_codes and exch not in exchange_codes:
+                continue
+            tickers.append(sym)
+            if len(_dedupe_symbols(tickers)) >= limit:
+                return _dedupe_symbols(tickers)[:limit]
+    return _dedupe_symbols(tickers)[:limit]
+
+
+def get_swing_universe_tickers(watchlist: str) -> list[str]:
+    key = (watchlist or "").strip().lower()
+    preset = SWING_UNIVERSE_PRESETS.get(key)
+    if not preset:
+        return []
+    ttl = 3600
+    now = time.time()
+    cached = _SWING_UNIVERSE_CACHE.get(key)
+    if cached and now - cached[0] < ttl:
+        return list(cached[1])
+
+    exchange = str(preset["exchange"])
+    min_price = float(preset["min_price"])
+    min_volume = int(preset["min_volume"])
+    limit = int(preset["limit"])
+    tickers: list[str] = []
+    try:
+        tickers = _alpaca_ranked_swing_universe(exchange, min_price, min_volume, limit)
+    except Exception as exc:
+        _scanner_logger.warning("[scanner] %s Alpaca universe failed: %s", key, str(exc)[:120])
+    if not tickers:
+        try:
+            tickers = _yahoo_ranked_swing_universe(exchange, min_price, min_volume, limit)
+        except Exception as exc:
+            _scanner_logger.warning("[scanner] %s Yahoo universe failed: %s", key, str(exc)[:120])
+    if tickers:
+        _SWING_UNIVERSE_CACHE[key] = (now, tickers)
+    return tickers
 
 
 ETF_SECTORS: dict[str, str] = {
