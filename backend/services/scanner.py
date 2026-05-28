@@ -191,7 +191,7 @@ class _WatchlistsDict(dict):
 WATCHLISTS: dict[str, list[str]] = _WatchlistsDict({
     "default": [
         "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AMD", "NFLX", "CRM",
-        "ORCL", "ADBE", "INTC", "PYPL", "SQ", "SHOP", "COIN", "UBER", "ABNB", "SNOW",
+        "ORCL", "ADBE", "INTC", "PYPL", "XYZ", "SHOP", "COIN", "UBER", "ABNB", "SNOW",
         "BA", "CAT", "GS", "JPM", "V", "MA", "DIS", "NKE", "SBUX", "MCD",
         "XOM", "CVX", "PFE", "JNJ", "UNH", "MRNA", "LLY", "ABBV", "BMY", "MRK",
         "SPY", "QQQ", "DIA", "XLF", "XLE", "XLK", "ARKK", "SOXX", "SMH", "MRVL",
