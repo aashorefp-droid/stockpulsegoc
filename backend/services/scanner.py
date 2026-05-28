@@ -1890,10 +1890,32 @@ def _compute_swing_levels(daily_df) -> dict:
     return out
 
 
+def _scanner_mode(mode: Optional[str]) -> str:
+    raw = (mode or "overview").strip().lower().replace("-", "_")
+    if raw in {"", "all", "full", "overview"}:
+        return "overview"
+    if raw == "swing":
+        return "swing"
+    if raw in {"longterm", "long_term", "lt"}:
+        return "longterm"
+    if raw in {"fib", "fib_targets", "fibonacci"}:
+        return "fib"
+    if raw in {"day", "daytrading", "day_trading", "dt4"}:
+        return "daytrading"
+    if raw in {"option", "options"}:
+        return "options"
+    return "overview"
+
+
 def scan_single(ticker: str, as_of: Optional[str] = None,
-                include_news: Optional[bool] = None) -> dict:
+                include_news: Optional[bool] = None,
+                mode: Optional[str] = None) -> dict:
     try:
         ticker = (ticker or "").strip().upper()
+        scan_mode = _scanner_mode(mode)
+        include_fundamentals = scan_mode in {"overview", "longterm"}
+        include_day_trading = scan_mode in {"overview", "daytrading"}
+        include_options = scan_mode in {"overview", "options"}
         is_etf = _is_etf_symbol(ticker)
         if as_of:
             end = date.fromisoformat(as_of)
@@ -1993,28 +2015,35 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
             vol_trend=vol_profile.get("vol_trend", "N/A"),
             trade=trade,
         )
-        fundamentals = _etf_fundamentals(ticker, price) if is_etf else _fundamentals_cached(ticker)
-        fundamentals.setdefault("price", price)
-        fundamental_signals = _fundamental_signals(ticker, fundamentals)
-        valuation = _valuation_estimate(fundamentals)
-        cpr = _cpr_fields(daily_df, price)
+        fundamentals = {"price": price}
+        fundamental_signals = ""
+        valuation = {}
+        if include_fundamentals:
+            fundamentals = _etf_fundamentals(ticker, price) if is_etf else _fundamentals_cached(ticker)
+            fundamentals.setdefault("price", price)
+            fundamental_signals = _fundamental_signals(ticker, fundamentals)
+            valuation = _valuation_estimate(fundamentals)
+
+        cpr = {}
         fib_targets = _fib_target_fields(
             ticker, daily_df, price, direction, end,
             include_earnings=not is_etf,
             next_earnings=next_earnings,
         )
-        cpr["cpr_day_volume_text"] = _day_volume_confirm_text(
-            cpr.get("cpr_position", ""),
-            vol_profile.get("vol_trend", "N/A"),
-            bool(vol_profile.get("vol_surge", False)),
-            vol_profile.get("vol_ratio"),
-        )
-        cpr.update(_opening_15m_volume_signal(ticker, end))
+        if include_day_trading:
+            cpr = _cpr_fields(daily_df, price)
+            cpr["cpr_day_volume_text"] = _day_volume_confirm_text(
+                cpr.get("cpr_position", ""),
+                vol_profile.get("vol_trend", "N/A"),
+                bool(vol_profile.get("vol_surge", False)),
+                vol_profile.get("vol_ratio"),
+            )
+            cpr.update(_opening_15m_volume_signal(ticker, end))
 
         # V4 day-trading: PDH/PWH/PDL/PWL plan engine. It uses the daily
         # bars already fetched for the scanner, so it is cheap and can be
         # turned off with DAY_TRADING_V4_ENABLED=0.
-        if _DAY_TRADING_V4_ENABLED:
+        if include_day_trading and _DAY_TRADING_V4_ENABLED:
             try:
                 from day_trading.v4 import analyze_from_daily as _dt4_analyze
                 _dt4 = _dt4_analyze(ticker, daily_df, scan_date=end, current_price=price)
@@ -2051,7 +2080,7 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
                     "dt4_setup": "error",
                     "dt4_note": str(exc)[:120],
                 })
-        else:
+        elif include_day_trading:
             cpr.update({"dt4_enabled": False, "dt4_setup": "disabled"})
 
         # V3 day-trading: PDH/PWH/PDL/PWL setup engine. Lazy-imported and
@@ -2061,6 +2090,8 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
         # bound the whole call so a stuck request can't drag the row at the
         # open (yfinance is regularly 8–10s/call when markets open).
         try:
+            if not include_day_trading:
+                raise StopIteration
             if not _DAY_TRADING_V3_ENABLED:
                 raise RuntimeError("DAY_TRADING_V3_DISABLED")
             from day_trading.v3 import analyze as _dt3_analyze
@@ -2115,6 +2146,8 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
                 "dt3_pwh":        _lvl.get("pwh"),
                 "dt3_pwl":        _lvl.get("pwl"),
             })
+        except StopIteration:
+            pass
         except Exception as _dt3_err:
             # Loud-but-bounded: log the cause so silent v3 disappearance has
             # a name. Still surface a heartbeat to the UI so the user sees
@@ -2139,7 +2172,7 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
             fund_sector = (fundamentals.get("sector") or "").strip()
             if fund_sector and fund_sector != "N/A":
                 sector = fund_sector
-        if _SCAN_INCLUDE_SHORT_FLOAT and not is_etf:
+        if include_fundamentals and _SCAN_INCLUDE_SHORT_FLOAT and not is_etf:
             try:
                 info = yf.Ticker(ticker).info
                 v = info.get("shortPercentOfFloat")
@@ -2157,7 +2190,7 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
         opt_legs = opt_width = opt_exp_short = opt_exp_long = opt_alt = None
         opt_liquid: list = []
         opt_disabled_reason: Optional[str] = None
-        if _SCAN_INCLUDE_OPTIONS and not is_etf:
+        if include_options and _SCAN_INCLUDE_OPTIONS and not is_etf:
             try:
                 strat = get_options_strategy(ticker, price, direction, ALPACA_API_KEY, ALPACA_API_SECRET)
                 if strat is None:
@@ -2190,7 +2223,7 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
                 )
 
         # OTM liquid options (Alpaca-only; optional because it adds one API call).
-        if _SCAN_INCLUDE_OPTIONS and not is_etf:
+        if include_options and _SCAN_INCLUDE_OPTIONS and not is_etf:
             try:
                 bias = get_options_bias(ticker, price, ALPACA_API_KEY, ALPACA_API_SECRET)
                 opt_liquid = bias.get("otm_liquid", [])[:5]
@@ -2322,7 +2355,7 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
         # Telegram alert on fresh V3 fire — gated by Actionable / Exceptional
         # / Rank 1 (all subsume mtf_rank==1). Daily dedup is inside the helper
         # so this is safe to call on every scan.
-        _tier = _v3_qualifying_tier(_row)
+        _tier = _v3_qualifying_tier(_row) if include_day_trading else None
         if _tier:
             _v3_alert_once(ticker, _row, tier=_tier)
         return _row

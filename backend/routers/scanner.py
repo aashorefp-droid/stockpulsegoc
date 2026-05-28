@@ -226,6 +226,7 @@ async def stream_scan(
     tickers:  str  = Query(""),          # comma-separated custom list
     as_of:    Optional[str] = Query(None),  # backtest date YYYY-MM-DD
     include_news: Optional[str] = Query(None),  # "1"/"true"/etc to opt-in per-scan
+    mode: Optional[str] = Query("overview"),
 ):
     # Parse the per-call news override. None = let the backend env default
     # decide; True/False = force this scan one way regardless of env.
@@ -256,7 +257,7 @@ async def stream_scan(
         async def _scan_all():
             pool = ThreadPoolExecutor(max_workers=max_workers)
             try:
-                futures = [loop.run_in_executor(pool, scan_single, t, as_of, news_override) for t in tickers]
+                futures = [loop.run_in_executor(pool, scan_single, t, as_of, news_override, mode) for t in tickers]
                 for coro in asyncio.as_completed(futures):
                     result = await coro
                     await queue.put(result)
