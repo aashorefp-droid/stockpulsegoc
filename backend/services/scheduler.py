@@ -58,6 +58,9 @@ _SCANNER_SNAPSHOT_ENABLED = _env_enabled(
     os.getenv("MOMENTUM_SNAPSHOT_ENABLED", "1"),
 )
 _SWEEP_DIGEST_ENABLED = _env_enabled("SWEEP_DIGEST_ENABLED", "1")
+_HOLDINGS_SUMMARY_ENABLED = _env_enabled("HOLDINGS_SUMMARY_ENABLED", "1")
+_HOLDINGS_EMAIL_ENABLED = _env_enabled("HOLDINGS_EMAIL_ENABLED", "1")
+_HOLDINGS_TELEGRAM_ENABLED = _env_enabled("HOLDINGS_TELEGRAM_ENABLED", "1")
 # Earnings jobs — pre-earnings discovery (8:30 CST) + EPS polling
 # (15:00–18:00 CST). Default OFF; set EARNINGS_JOBS_ENABLED=1 to re-enable.
 _EARNINGS_JOBS_ENABLED = _env_enabled("EARNINGS_JOBS_ENABLED", "0")
@@ -585,6 +588,308 @@ def sweep_digest_job():
         )
     except Exception as e:
         logger.error(f"[scheduler] sweep digest failed: {e}")
+
+
+def holdings_summary_job():
+    """Post-market: email and Telegram a focused holdings scanner summary."""
+    if not _HOLDINGS_SUMMARY_ENABLED:
+        logger.info("[scheduler] holdings summary skipped: HOLDINGS_SUMMARY_ENABLED=0")
+        return
+
+    import html
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        from backend.db.holdings_store import get_holdings_tickers
+        from backend.services.email_svc import send_email
+        from backend.services.scanner import scan_single
+
+        tickers = get_holdings_tickers()
+        if not tickers:
+            logger.info("[scheduler] holdings summary skipped: holdings list is empty")
+            return
+
+        try:
+            workers = int(os.getenv("HOLDINGS_SCAN_MAX_WORKERS", "5"))
+        except ValueError:
+            workers = 5
+        workers = max(1, min(len(tickers), workers))
+
+        by_ticker: dict[str, dict] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # longterm mode keeps fundamentals/long-term context and skips
+            # day-trading and options work. Swing + Fib fields are still built.
+            futures = {pool.submit(scan_single, t, None, None, "longterm"): t for t in tickers}
+            for fut in as_completed(futures):
+                ticker = futures[fut]
+                try:
+                    by_ticker[ticker] = fut.result()
+                except Exception as exc:
+                    by_ticker[ticker] = {"ticker": ticker, "error": str(exc)[:120], "score": 0}
+        rows = [by_ticker.get(t, {"ticker": t, "error": "scan missing", "score": 0}) for t in tickers]
+
+        def _money(v) -> str:
+            return f"${float(v):.2f}" if isinstance(v, (int, float)) else "-"
+
+        def _pct(v) -> str:
+            return f"{float(v):.2f}%" if isinstance(v, (int, float)) else "-"
+
+        def _txt(v) -> str:
+            return html.escape(str(v if v is not None else "-"))
+
+        def _color_for_verdict(verdict: str) -> str:
+            v = (verdict or "").upper()
+            if "BULLISH" in v:
+                return "#047857"
+            if "BEARISH" in v or "SHORT" in v:
+                return "#dc2626"
+            return "#6b7280"
+
+        def _color_for_status(status: str) -> str:
+            return {
+                "Actionable": "#047857",
+                "PreBO": "#b45309",
+                "BTD Trigger": "#0f766e",
+                "Rank 1": "#2563eb",
+                "Watch": "#6b7280",
+                "Error": "#dc2626",
+            }.get(status, "#6b7280")
+
+        def _zone_style(zone: str) -> str:
+            z = (zone or "").upper()
+            if z in {"", "-", "NONE", "N/A"}:
+                return "color:#6b7280;background:#f3f4f6;border:1px solid #e5e7eb;"
+            if z == "LOW":
+                return "color:#047857;background:#ecfdf5;border:1px solid #a7f3d0;"
+            if z == "HIGH":
+                return "color:#dc2626;background:#fef2f2;border:1px solid #fecaca;"
+            if z:
+                return "color:#92400e;background:#fffbeb;border:1px solid #fde68a;"
+            return "color:#6b7280;background:#f3f4f6;border:1px solid #e5e7eb;"
+
+        def _badge(label: str, color: str) -> str:
+            return (
+                f"<span style=\"display:inline-block;border-radius:4px;padding:2px 6px;"
+                f"font-weight:700;color:{color};background:#f9fafb;border:1px solid #e5e7eb;\">"
+                f"{html.escape(label)}</span>"
+            )
+
+        def _zone_badge(prefix: str, zone: str) -> str:
+            value = html.escape(str(zone or "-"))
+            return (
+                f"<span style=\"display:inline-block;border-radius:4px;padding:2px 6px;"
+                f"font-weight:700;{_zone_style(zone)}\">{html.escape(prefix)} {value}</span>"
+            )
+
+        def _entry_range(row: dict) -> str:
+            entry = row.get("lre_entry")
+            stop = row.get("lre_stop")
+            if isinstance(entry, (int, float)) and isinstance(stop, (int, float)):
+                lo = min(float(entry), float(stop))
+                hi = max(float(entry), float(stop))
+                return f"{_money(lo)} - {_money(hi)}"
+            if isinstance(row.get("entry"), (int, float)) and isinstance(row.get("stop_loss"), (int, float)):
+                lo = min(float(row["entry"]), float(row["stop_loss"]))
+                hi = max(float(row["entry"]), float(row["stop_loss"]))
+                return f"{_money(lo)} - {_money(hi)}"
+            return "-"
+
+        def _emas(row: dict) -> str:
+            vals = [
+                ("11", row.get("ema11")),
+                ("20", row.get("ema20")),
+                ("50", row.get("ema50")),
+                ("200", row.get("ema200")),
+            ]
+            out = [f"EMA{k} {_money(v)}" for k, v in vals if isinstance(v, (int, float))]
+            if isinstance(row.get("ema50_slope_pct"), (int, float)):
+                sign = "+" if float(row["ema50_slope_pct"]) > 0 else ""
+                out.append(f"50 slope {sign}{float(row['ema50_slope_pct']):.2f}%")
+            return " | ".join(out) or "-"
+
+        def _pw_levels(row: dict) -> str:
+            parts: list[str] = []
+            if isinstance(row.get("prev_week_high"), (int, float)):
+                parts.append(f"PWH/L {_money(row.get('prev_week_high'))} / {_money(row.get('prev_week_low'))}")
+            if isinstance(row.get("prev_month_high"), (int, float)):
+                parts.append(f"PMH/L {_money(row.get('prev_month_high'))} / {_money(row.get('prev_month_low'))}")
+            if isinstance(row.get("wk52_high"), (int, float)):
+                parts.append(f"52wH/L {_money(row.get('wk52_high'))} / {_money(row.get('wk52_low'))}")
+            return " | ".join(parts) or "-"
+
+        def _long_term(row: dict) -> str:
+            if row.get("error"):
+                return html.escape(str(row.get("error") or "scan failed"))
+            parts: list[str] = []
+            if row.get("w30ma_curl"):
+                parts.append(f"30wk MA curl {_money(row.get('w30ma'))}")
+            if row.get("long_term_spring"):
+                parts.append("Weekly spring")
+            if row.get("lre_status") or row.get("lre_label"):
+                label = " ".join(str(v) for v in (row.get("lre_status"), row.get("lre_label")) if v)
+                entry = _money(row.get("lre_entry"))
+                stop = _money(row.get("lre_stop"))
+                risk = _pct(row.get("lre_risk_pct"))
+                parts.append(f"{label} entry {entry} / stop {stop} / risk {risk}")
+            entry_range = _entry_range(row)
+            if entry_range != "-":
+                parts.append(f"Entry range {entry_range}")
+            emas = _emas(row)
+            if emas != "-":
+                parts.append(emas)
+            pw = _pw_levels(row)
+            if pw != "-":
+                parts.append(pw)
+            return html.escape("; ".join(parts) or "-")
+
+        def _swing(row: dict) -> str:
+            if row.get("error"):
+                return "-"
+            parts = [
+                f"Entry {_money(row.get('entry'))}",
+                f"Stop {_money(row.get('stop_loss'))}",
+                f"T1 {_money(row.get('target1'))}",
+            ]
+            eta = row.get("t1_days_text") or row.get("t1_days")
+            if eta:
+                parts.append(f"ETA {eta}")
+            if row.get("btd_state"):
+                parts.append(f"BTD {row.get('btd_state')}")
+            if row.get("swing_prebreakout"):
+                parts.append(
+                    f"PreBO {_pct(row.get('swing_prebreakout_dist_pct'))} under "
+                    f"{_money(row.get('swing_prebreakout_level'))}"
+                )
+            return html.escape(" | ".join(parts))
+
+        def _fib(row: dict) -> str:
+            if row.get("error"):
+                return "-"
+            weekly = row.get("weekly_zone") or "-"
+            earn = row.get("earn_zone") or "-"
+            return html.escape(f"Wk {weekly} | Earn {earn}")
+
+        def _status(row: dict) -> str:
+            if row.get("error"):
+                return "Error"
+            if row.get("lre_status") in ("ACTIVE", "DISCOUNT"):
+                return "Actionable"
+            if row.get("swing_prebreakout"):
+                return "PreBO"
+            if row.get("btd_state") == "TRIGGER":
+                return "BTD Trigger"
+            if row.get("mtf_rank") == 1:
+                return "Rank 1"
+            return "Watch"
+
+        errors = sum(1 for r in rows if r.get("error"))
+        notable = sum(1 for r in rows if _status(r) in {"Actionable", "PreBO", "BTD Trigger", "Rank 1"})
+        now = datetime.now(CST)
+        subject = f"StockPulse Holdings Summary - {now:%Y-%m-%d}"
+
+        html_rows = []
+        for row in rows:
+            status = _status(row)
+            verdict = str(row.get("verdict") or "-")
+            html_rows.append(
+                "<tr>"
+                f"<td style=\"border:1px solid #e5e7eb;padding:8px;vertical-align:top;\"><b>{_txt(str(row.get('ticker') or '').upper())}</b></td>"
+                f"<td style=\"border:1px solid #e5e7eb;padding:8px;vertical-align:top;text-align:right;font-family:Consolas,monospace;\">{_money(row.get('price'))}</td>"
+                f"<td style=\"border:1px solid #e5e7eb;padding:8px;vertical-align:top;\">{_badge(verdict, _color_for_verdict(verdict))}</td>"
+                f"<td style=\"border:1px solid #e5e7eb;padding:8px;vertical-align:top;\">{_badge(status, _color_for_status(status))}</td>"
+                f"<td style=\"border:1px solid #e5e7eb;padding:8px;vertical-align:top;\">{_long_term(row)}</td>"
+                f"<td style=\"border:1px solid #e5e7eb;padding:8px;vertical-align:top;\">{_swing(row)}</td>"
+                f"<td style=\"border:1px solid #e5e7eb;padding:8px;vertical-align:top;white-space:nowrap;\">"
+                f"{_zone_badge('Wk', str(row.get('weekly_zone') or '-'))} "
+                f"{_zone_badge('Earn', str(row.get('earn_zone') or '-'))}</td>"
+                "</tr>"
+            )
+
+        html_body = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+</head>
+<body style="font-family:Arial,sans-serif;color:#111827;margin:0;padding:16px;background:#ffffff;">
+  <h2 style="margin:0 0 6px 0;">StockPulse Holdings Summary</h2>
+  <p style="color:#6b7280;font-size:12px;margin:0 0 14px 0;">{now:%Y-%m-%d %H:%M CT} &middot; {len(rows)} scanned &middot; {notable} notable &middot; {errors} errors</p>
+  <table style="border-collapse:collapse;width:100%;font-size:13px;">
+    <thead>
+      <tr>
+        <th style="background:#111827;color:#ffffff;text-align:left;padding:8px;border:1px solid #111827;">Ticker</th>
+        <th style="background:#111827;color:#ffffff;text-align:left;padding:8px;border:1px solid #111827;">Price</th>
+        <th style="background:#111827;color:#ffffff;text-align:left;padding:8px;border:1px solid #111827;">Verdict</th>
+        <th style="background:#111827;color:#ffffff;text-align:left;padding:8px;border:1px solid #111827;">Status</th>
+        <th style="background:#111827;color:#ffffff;text-align:left;padding:8px;border:1px solid #111827;">Long Term</th>
+        <th style="background:#111827;color:#ffffff;text-align:left;padding:8px;border:1px solid #111827;">Swing</th>
+        <th style="background:#111827;color:#ffffff;text-align:left;padding:8px;border:1px solid #111827;">Fib Zones</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(html_rows)}
+    </tbody>
+  </table>
+</body>
+</html>"""
+
+        text_lines = [
+            f"StockPulse Holdings Summary - {now:%Y-%m-%d %H:%M CT}",
+            f"{len(rows)} scanned | {notable} notable | {errors} errors",
+            "",
+        ]
+        for row in rows:
+            text_lines.append(
+                f"{str(row.get('ticker') or '').upper()} | {_money(row.get('price'))} | "
+                f"{row.get('verdict') or '-'} | {_status(row)} | "
+                f"LT: {html.unescape(_long_term(row))} | "
+                f"Swing: {html.unescape(_swing(row))} | "
+                f"Fib: {html.unescape(_fib(row))}"
+            )
+        text_body = "\n".join(text_lines)
+
+        email_ok = True
+        if _HOLDINGS_EMAIL_ENABLED:
+            email_ok = send_email(subject, html_body, text_body)
+            if not email_ok:
+                logger.warning("[scheduler] holdings summary email send failed")
+
+        telegram_ok = True
+        if _HOLDINGS_TELEGRAM_ENABLED:
+            blocks = [
+                f"<b>{_txt(str(r.get('ticker') or '').upper())}</b> {_money(r.get('price'))} | "
+                f"{_txt(r.get('verdict') or '-')} | {html.escape(_status(r))}\n"
+                f"LT: {_long_term(r)}\n"
+                f"Swing: {_swing(r)}\n"
+                f"Fib: {_fib(r)}"
+                for r in rows
+            ]
+            header = (
+                f"<b>Holdings Summary - {now:%Y-%m-%d}</b>\n"
+                f"{len(rows)} scanned | {notable} notable | {errors} errors"
+            )
+            chunks: list[str] = []
+            current = header
+            for block in blocks:
+                if len(current) + len(block) + 2 > 3600 and current != header:
+                    chunks.append(current)
+                    current = "<b>Holdings Summary - continued</b>"
+                current += "\n\n" + block
+            chunks.append(current)
+            for chunk in chunks:
+                telegram_ok = send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk) and telegram_ok
+            if not telegram_ok:
+                logger.warning("[scheduler] holdings summary telegram send failed")
+
+        logger.info(
+            "[scheduler] holdings summary completed: %s scanned, %s notable, %s errors, email=%s, telegram=%s",
+            len(rows),
+            notable,
+            errors,
+            email_ok,
+            telegram_ok,
+        )
+    except Exception as e:
+        logger.error(f"[scheduler] holdings summary failed: {e}")
 
 
 #: Watchlists scanned by the 8:00 AM CST news digest. Restricted to these
@@ -1137,6 +1442,14 @@ def setup_scheduler():
         misfire_grace_time=3600,
     )
 
+    scheduler.add_job(
+        holdings_summary_job,
+        CronTrigger(hour=15, minute=50, timezone=CST),
+        id="holdings_summary_close",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
     # Sunday 6 PM CST — re-screen the momentum universe and persist top 20.
     # Misfire grace 6h so a Sunday-evening service restart still gets it.
     scheduler.add_job(
@@ -1224,7 +1537,10 @@ def setup_scheduler():
         logger.warning(f"[scheduler] startup TOS/Gmail prime failed: {e}")
 
     _macro_w = "macro_regime_watch every 5m Mon-Fri 8-15:55CST" if _MACRO_ALERTS_ENABLED else "macro_regime_watch DISABLED"
-    logger.info(f"[scheduler] registered: scanner_snapshots@15:25CST, sweep_digest@15:40CST, momentum_refresh@Sun18:00CST, {_macro_w}")
+    logger.info(
+        f"[scheduler] registered: scanner_snapshots@15:25CST, sweep_digest@15:40CST, "
+        f"holdings_summary@15:50CST daily, momentum_refresh@Sun18:00CST, {_macro_w}"
+    )
     _earn = (
         "pre_earnings@8:30CST, polling 15:00–18:00 CST"
         if _EARNINGS_JOBS_ENABLED

@@ -15,6 +15,7 @@ from backend.services.scanner import (
     WATCHLISTS, SWING_UNIVERSE_PRESETS, scan_single, get_short_squeeze_tickers,
     get_swing_universe_tickers, get_telegram_watchlist,
 )
+from backend.db.holdings_store import get_holdings_tickers, load_holdings, save_holdings
 
 router = APIRouter(prefix="/api/scanner", tags=["scanner"])
 
@@ -23,7 +24,19 @@ router = APIRouter(prefix="/api/scanner", tags=["scanner"])
 def get_watchlists():
     out = {k: len(v) for k, v in WATCHLISTS.items()}
     out.update({k: int(v.get("limit", 0)) for k, v in SWING_UNIVERSE_PRESETS.items()})
+    out["holdings"] = len(get_holdings_tickers())
     return out
+
+
+@router.get("/holdings")
+def get_holdings():
+    return load_holdings()
+
+
+@router.post("/holdings")
+def update_holdings(payload: dict = Body(...)):
+    raw = payload.get("tickers", payload.get("symbols", ""))
+    return save_holdings(raw)
 
 
 @router.post("/v3-refresh")
@@ -244,6 +257,9 @@ async def stream_scan(
     elif watchlist == "telegram":
         loop = asyncio.get_event_loop()
         ticker_list = await loop.run_in_executor(None, get_telegram_watchlist)
+    elif watchlist == "holdings":
+        loop = asyncio.get_event_loop()
+        ticker_list = await loop.run_in_executor(None, get_holdings_tickers)
     elif watchlist in SWING_UNIVERSE_PRESETS:
         loop = asyncio.get_event_loop()
         ticker_list = await loop.run_in_executor(None, get_swing_universe_tickers, watchlist)

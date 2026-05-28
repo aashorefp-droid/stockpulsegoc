@@ -14,6 +14,7 @@ const WATCHLISTS = [
   { key: "etfs",          label: "ETFs 56",           count: 56  },
   { key: "short_squeeze", label: "🔥 Short Squeeze",  count: 40  },
   { key: "telegram",      label: "📧 TOS Scan (7 PM)", count: 25 },
+  { key: "holdings",      label: "Holdings",           count: 0   },
   { key: "nyse_swing",    label: "🏛 NYSE Swing >$10", count: 200 },
   { key: "nasdaq_swing",  label: "💻 NASDAQ Swing >$10", count: 200 },
   { key: "custom",        label: "Custom",            count: 0   },
@@ -730,6 +731,10 @@ export default function ScannerPage() {
   const [scannerCollapsed, setScannerCollapsed] = useState(false);
   const [houseRulesOpen, setHouseRulesOpen] = useState(true);
   const [customInput,  setCustomInput]  = useState("");
+  const [holdingsInput, setHoldingsInput] = useState("");
+  const [holdingsTickers, setHoldingsTickers] = useState<string[]>([]);
+  const [holdingsSaving, setHoldingsSaving] = useState(false);
+  const [holdingsMsg, setHoldingsMsg] = useState("");
   const [tickerFilter, setTickerFilter] = useState("");
   const [scanning,     setScanning]     = useState(false);
   const [results,      setResults]      = useState<ScanResult[]>([]);
@@ -796,6 +801,26 @@ export default function ScannerPage() {
     .map(r => r.ticker.toUpperCase())
     .sort()
     .join(",");
+
+  useEffect(() => {
+    let alive = true;
+    async function loadHoldings() {
+      try {
+        const res = await fetch(`${API_BASE}/api/scanner/holdings`);
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+        const tickers = Array.isArray(json?.tickers) ? json.tickers.map((t: string) => String(t).toUpperCase()) : [];
+        if (!alive) return;
+        setHoldingsTickers(tickers);
+        setHoldingsInput(tickers.join(", "));
+        setHoldingsMsg(tickers.length ? `Loaded ${tickers.length}` : "");
+      } catch (e: any) {
+        if (alive) setHoldingsMsg(`Load failed: ${e?.message ?? e}`);
+      }
+    }
+    loadHoldings();
+    return () => { alive = false; };
+  }, []);
 
   useEffect(() => {
     if (!optModal) return;
@@ -1112,7 +1137,9 @@ export default function ScannerPage() {
       total = tickers.length;
       url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scannerMode)}&tickers=${encodeURIComponent(tickers.join(","))}`;
     } else {
-      total = WATCHLISTS.find(w => w.key === scanWatchlist)?.count ?? 50;
+      total = scanWatchlist === "holdings"
+        ? holdingsTickers.length
+        : WATCHLISTS.find(w => w.key === scanWatchlist)?.count ?? 50;
       url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scannerMode)}&watchlist=${scanWatchlist}`;
     }
 
@@ -1157,6 +1184,29 @@ export default function ScannerPage() {
   function stopScan() {
     esRef.current?.close();
     setScanning(false);
+  }
+
+  async function saveHoldings() {
+    setHoldingsSaving(true);
+    setHoldingsMsg("Saving...");
+    try {
+      const res = await fetch(`${API_BASE}/api/scanner/holdings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tickers: holdingsInput }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+      const tickers = Array.isArray(json?.tickers) ? json.tickers.map((t: string) => String(t).toUpperCase()) : [];
+      setHoldingsTickers(tickers);
+      setHoldingsInput(tickers.join(", "));
+      setHoldingsMsg(`Saved ${tickers.length}`);
+      setWatchlist("holdings");
+    } catch (e: any) {
+      setHoldingsMsg(`Save failed: ${e?.message ?? e}`);
+    } finally {
+      setHoldingsSaving(false);
+    }
   }
 
   async function hardPullTelegram() {
@@ -1360,6 +1410,12 @@ export default function ScannerPage() {
   const selectedWatchlist = WATCHLISTS.find(w => w.key === watchlist);
   const selectedScannerMode = SCANNER_MODES.find(m => m.key === scannerMode) ?? SCANNER_MODES[0];
   const customTickerCount = customInput.split(",").filter(t => t.trim()).length;
+  const holdingsTickerCount = holdingsTickers.length;
+  const selectedWatchlistCount = watchlist === "custom"
+    ? customTickerCount
+    : watchlist === "holdings"
+      ? holdingsTickerCount
+      : selectedWatchlist?.count ?? 0;
   const showLongTermCol = scannerMode === "overview" || scannerMode === "longterm";
   const showSwingCol = scannerMode === "overview" || scannerMode === "swing";
   const showFibCol = scannerMode === "overview" || scannerMode === "fib";
@@ -1392,9 +1448,7 @@ export default function ScannerPage() {
                 {selectedWatchlist?.label ?? watchlist}
               </span>
               <span className="text-xs text-muted">
-                {watchlist === "custom"
-                  ? `${customTickerCount} ticker${customTickerCount !== 1 ? "s" : ""}`
-                  : `${selectedWatchlist?.count ?? 0} tickers`}
+                {`${selectedWatchlistCount} ticker${selectedWatchlistCount !== 1 ? "s" : ""}`}
               </span>
             </span>
             <span className={`whitespace-nowrap rounded border px-2 py-1 text-xs font-bold transition-colors ${
@@ -1556,6 +1610,53 @@ export default function ScannerPage() {
                   </div>
                 );
               }
+              if (w.key === "holdings") {
+                return (
+                  <div key={w.key} className={`flex items-center gap-1 rounded-lg border px-2 py-1 ${
+                    watchlist === w.key ? "border-accent/50 bg-surface" : "border-border bg-transparent"
+                  }`}>
+                    <button onClick={() => setWatchlist(w.key)}
+                      className={`px-2 py-1 text-xs rounded font-semibold transition-colors ${
+                        watchlist === w.key ? "text-accent" : "text-muted hover:text-white"
+                      }`}>
+                      {w.label}
+                    </button>
+                    {watchlist === w.key && (
+                      <>
+                        <input
+                          autoFocus
+                          type="text"
+                          value={holdingsInput}
+                          onChange={e => setHoldingsInput(e.target.value)}
+                          onKeyDown={e => e.key === "Enter" && !holdingsSaving && saveHoldings()}
+                          placeholder="AAPL, MSFT"
+                          className="w-52 rounded border border-border bg-transparent px-2 py-1 text-xs font-mono text-white placeholder-muted focus:border-accent focus:outline-none"
+                        />
+                        <button
+                          onClick={saveHoldings}
+                          disabled={holdingsSaving}
+                          className="rounded border border-accent/40 px-2 py-1 text-xs font-bold text-accent hover:bg-accent/10 disabled:opacity-40"
+                        >
+                          {holdingsSaving ? "Saving" : "Save"}
+                        </button>
+                        <button
+                          onClick={scanning ? stopScan : () => startScan("holdings")}
+                          disabled={!scanning && (!holdingsTickerCount || (mode === "backtest" && !backtestDate))}
+                          className={`rounded px-2 py-1 text-xs font-bold transition-colors ${
+                            scanning
+                              ? "border border-red/30 bg-red/20 text-red hover:bg-red/30"
+                              : !holdingsTickerCount || (mode === "backtest" && !backtestDate)
+                                ? "border border-border bg-card text-muted cursor-not-allowed"
+                                : "border border-accent bg-accent text-black hover:bg-accent/85"
+                          }`}
+                        >
+                          {scanning ? "STOP" : "SCAN"}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                );
+              }
               if (w.key === "telegram") {
                 return (
                   <div key={w.key} className="flex items-center gap-1">
@@ -1590,6 +1691,9 @@ export default function ScannerPage() {
             })}
             {tgPullMsg && (
               <span className="self-center text-[11px] text-muted">{tgPullMsg}</span>
+            )}
+            {holdingsMsg && (
+              <span className="self-center text-[11px] text-muted">{holdingsMsg}</span>
             )}
           </div>
         )}

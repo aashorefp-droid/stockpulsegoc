@@ -86,3 +86,11 @@ def trigger_sweep_digest():
     from backend.services.scheduler import sweep_digest_job
     sweep_digest_job()
     return {"status": "sweep digest completed"}
+
+
+@router.post("/run-holdings")
+def trigger_holdings_summary():
+    """Manually trigger the post-market holdings swing summary."""
+    from backend.services.scheduler import holdings_summary_job
+    holdings_summary_job()
+    return {"status": "holdings summary completed"}
