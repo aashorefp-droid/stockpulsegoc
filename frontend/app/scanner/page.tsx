@@ -1030,7 +1030,7 @@ export default function ScannerPage() {
   }
 
   // Watchlists with daily-saved snapshots — load instantly instead of running a live scan.
-  const SNAPSHOT_WATCHLISTS = ["default", "momentum", "nyse_swing", "nasdaq_swing"];
+  const SNAPSHOT_WATCHLISTS = ["default", "momentum"];
   const [snapshotStatus, setSnapshotStatus] = useState<string>("");
 
   async function fetchSnapshot(key: string) {
@@ -1040,6 +1040,7 @@ export default function ScannerPage() {
   }
 
   async function loadSnapshot(key: string) {
+    let fallbackToLive = false;
     setResults([]);
     setScanning(true);
     setProgress({ done: 0, total: 0 });
@@ -1061,7 +1062,9 @@ export default function ScannerPage() {
           json = await fetchSnapshot(key);
           if (json.available && json.results && json.results.length > 0) break;
           if (i === maxAttempts - 1) {
-            throw new Error("Snapshot build timed out after 5 minutes");
+            fallbackToLive = true;
+            setSnapshotStatus("Snapshot still building; switching to live scan.");
+            return;
           }
         }
       }
@@ -1075,22 +1078,25 @@ export default function ScannerPage() {
       setSnapshotStatus(`Failed: ${e?.message ?? e}`);
     } finally {
       setScanning(false);
+      if (fallbackToLive) {
+        window.setTimeout(() => startScan(key, true), 0);
+      }
     }
   }
 
-  function startScan(scanWatchlist: string = watchlist) {
+  function startScan(scanWatchlist: string = watchlist, forceLive = false) {
     if (esRef.current) esRef.current.close();
     if (refresh15mRef.current) refresh15mRef.current.close();
     refresh15mBusyRef.current = false;
     setAuto15mStatus("");
-    setSnapshotStatus("");
+    setSnapshotStatus(forceLive ? "Live scan running while snapshot finishes." : "");
     setScannerCollapsed(false);
     if (scanWatchlist === "custom" && watchlist !== "custom") {
       setWatchlist("custom");
     }
 
     // For saved daily snapshots in live mode, prefer the Neon-backed snapshot (faster).
-    if (mode === "live" && scannerMode === "overview" && SNAPSHOT_WATCHLISTS.includes(scanWatchlist)) {
+    if (!forceLive && mode === "live" && scannerMode === "overview" && SNAPSHOT_WATCHLISTS.includes(scanWatchlist)) {
       loadSnapshot(scanWatchlist);
       return;
     }
@@ -1129,6 +1135,7 @@ export default function ScannerPage() {
       if (data.done) {
         setScanning(false);
         setProgress(p => ({ ...p, done: data.total ?? p.done }));
+        setSnapshotStatus("");
         setScannerCollapsed(true);
         es.close();
         return;
@@ -1139,6 +1146,7 @@ export default function ScannerPage() {
 
     es.onerror = () => {
       setScanning(false);
+      setSnapshotStatus("");
       es.close();
     };
   }
