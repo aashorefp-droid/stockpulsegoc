@@ -2,14 +2,22 @@
 Options bias helper + Alpaca strategy recommendation.
 Strategy mirrors get_options_strategy_alpaca() from stock_pulse.py exactly:
   - Alpaca /v1beta1/options/snapshots only
-  - Bull Call Spread (LONG) · Bear Put Spread (SHORT) · Iron Butterfly (NEUTRAL)
+  - Bull Call Spread (LONG) · Bear Put Spread (SHORT) · Iron Butterfly / Iron Condor (NEUTRAL)
   - zone parameter (HIGH/MID/LOW) derived from Fib position drives neutral detection
 """
 import requests
 import time
+import os
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from backend.config import ALPACA_DATA_BASE
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+OPTIONS_PREFER_PUTS = _env_enabled("OPTIONS_PREFER_PUTS", "1")
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -406,8 +414,9 @@ def _fetch_contracts_alpaca(ticker: str, api_key: str, api_secret: str,
         today   = date.today()
         exp_min = (today + timedelta(days=5)).isoformat()
         exp_max = (today + timedelta(days=60)).isoformat()
-        s_lo    = current_price * 0.85 if current_price > 0 else 0
-        s_hi    = current_price * 1.15 if current_price > 0 else float("inf")
+        # Keep enough OTM strikes for four-leg structures like iron condors.
+        s_lo    = current_price * 0.70 if current_price > 0 else 0
+        s_hi    = current_price * 1.30 if current_price > 0 else float("inf")
 
         # Paginate snapshots endpoint (max 1000/page) until we have enough
         # relevant contracts or we run out of pages.
@@ -603,6 +612,15 @@ def _validate_spread(net_debit: float, spread_width: float) -> bool:
     return True
 
 
+def _validate_credit_spread(credit: float, spread_width: float) -> bool:
+    """Reject economically impossible credit spreads."""
+    if credit <= 0:
+        return False
+    if credit >= spread_width:
+        return False
+    return True
+
+
 # ── Strategy builder — exact logic from stock_pulse.py ───────────────────────
 
 def _build_strategy(ticker: str, current_price: float, direction: str,
@@ -654,6 +672,13 @@ def _build_strategy(ticker: str, current_price: float, direction: str,
     puts_s  = [c for c in liquid if c["exp"] == exp_short and not c["is_call"]]
     calls_l = [c for c in liquid if c["exp"] == exp_long  and c["is_call"]]
     puts_l  = [c for c in liquid if c["exp"] == exp_long  and not c["is_call"]]
+    condor_liquid = [
+        c for c in contracts
+        if c["exp"] == exp_long
+        and _is_liquid(c, max_spread_pct=1.20, min_oi=0, min_mid=0.01)
+    ]
+    calls_l_condor = [c for c in condor_liquid if c["is_call"]]
+    puts_l_condor = [c for c in condor_liquid if not c["is_call"]]
 
     def _median(values):
         vals = sorted(v for v in values if v and v > 0)
@@ -733,6 +758,16 @@ def _build_strategy(ticker: str, current_price: float, direction: str,
         if debit_pct <= 0.25:
             return "IV fit: good price"
         return "IV fit: okay"
+
+    def _condor_fit(credit: float, width: float) -> str:
+        if width <= 0:
+            return "Credit fit: unknown"
+        credit_pct = credit / width
+        if credit_pct >= 0.33:
+            return "Credit fit: rich"
+        if credit_pct >= 0.20:
+            return "Credit fit: fair"
+        return "Credit fit: thin"
 
     def _strike(c) -> str:
         value = float(c["strike"])
@@ -848,6 +883,43 @@ def _build_strategy(ticker: str, current_price: float, direction: str,
             f"Debit {debit_pct:.0f}% of width"
         )
 
+    def _iron_condor() -> Optional[str]:
+        short_c = _pick([c for c in calls_l_condor if c["strike"] > current_price * 1.02],
+                        current_price * 1.03)
+        short_p = _pick([p for p in puts_l_condor if p["strike"] < current_price * 0.98],
+                        current_price * 0.97)
+        if not short_c or not short_p:
+            return None
+
+        call_gap = max(short_c["strike"] - current_price, current_price * 0.03)
+        put_gap = max(current_price - short_p["strike"], current_price * 0.03)
+        wing_gap = max(call_gap, put_gap)
+        long_c = _pick([c for c in calls_l_condor if c["strike"] > short_c["strike"]],
+                       short_c["strike"] + wing_gap)
+        long_p = _pick([p for p in puts_l_condor if p["strike"] < short_p["strike"]],
+                       short_p["strike"] - wing_gap)
+        if not long_c or not long_p:
+            return None
+
+        call_width = round(long_c["strike"] - short_c["strike"], 2)
+        put_width = round(short_p["strike"] - long_p["strike"], 2)
+        width = max(call_width, put_width)
+        credit = round(mid(short_c) + mid(short_p) - mid(long_c) - mid(long_p), 2)
+        if credit <= 0 or width <= 0 or credit >= width:
+            return None
+
+        max_loss = round(width - credit, 2)
+        be_low = round(short_p["strike"] - credit, 2)
+        be_high = round(short_c["strike"] + credit, 2)
+        credit_pct = credit / width * 100
+        return (
+            f"Iron Condor: Buy ${_strike(long_p)}P / Sell ${_strike(short_p)}P + "
+            f"Sell ${_strike(short_c)}C / Buy ${_strike(long_c)}C Exp {exp_long} | "
+            f"Credit ~${credit:.2f} | BE ${be_low:.2f}-${be_high:.2f} | "
+            f"Max loss ~${max_loss:.2f} | {_iv_summary()} | "
+            f"{_condor_fit(credit, width)} | Credit {credit_pct:.0f}% of width"
+        )
+
     # Determine strategy type — mirrors original logic exactly
     is_bullish = (direction == "LONG") or (zone == "LOW" and direction != "SHORT")
     is_bearish = (direction == "SHORT") or (zone == "HIGH" and direction != "LONG")
@@ -861,47 +933,79 @@ def _build_strategy(ticker: str, current_price: float, direction: str,
     }
 
     if is_bullish:
-        buy_c  = _pick(calls_l, current_price)
-        sell_c = _pick(calls_l, current_price * 1.03) if buy_c else None
-        if sell_c and buy_c and sell_c["strike"] == buy_c["strike"]:
-            sell_c = _pick([c for c in calls_l if c["strike"] > buy_c["strike"]],
-                           buy_c["strike"] + 1)
+        put_credit_ok = False
+        if OPTIONS_PREFER_PUTS:
+            sell_p = _pick([p for p in puts_l if p["strike"] < current_price], current_price * 0.97)
+            buy_p = (
+                _pick([p for p in puts_l if p["strike"] < sell_p["strike"]], sell_p["strike"] - current_price * 0.03)
+                if sell_p else None
+            )
+            if sell_p and buy_p and sell_p["strike"] != buy_p["strike"]:
+                credit = round(mid(sell_p) - mid(buy_p), 2)
+                width = round(sell_p["strike"] - buy_p["strike"], 2)
+                max_loss = round(width - credit, 2)
+                if _validate_credit_spread(credit, width):
+                    put_credit_ok = True
+                    result.update({
+                        "strategy": "Bull Put Spread",
+                        "legs": [_leg("SELL", "PUT", sell_p, exp_long),
+                                 _leg("BUY", "PUT", buy_p, exp_long)],
+                        "net_debit":  -credit,
+                        "max_profit": credit,
+                        "width":      width,
+                        "quote_ts":   sell_p.get("quote_ts"),
+                        "summary": (f"📈 {ticker} Bull Put Spread: "
+                                    f"Width: ${width:.0f}  "
+                                    f"Sell ${sell_p['strike']:.0f}P / Buy ${buy_p['strike']:.0f}P "
+                                    f"Exp {exp_long} | Credit ~${credit:.2f} | "
+                                    f"Max Loss ~${max_loss:.2f} | {_iv_summary()}"),
+                        "alt": "",
+                    })
 
-        spread_ok = False
-        if buy_c and sell_c and sell_c["strike"] != buy_c["strike"]:
-            net_debit  = round(mid(buy_c) - mid(sell_c), 2)
-            width      = round(sell_c["strike"] - buy_c["strike"], 2)
-            max_profit = round(width - net_debit, 2)
-            if _validate_spread(net_debit, width):
-                spread_ok = True
-                result.update({
-                    "strategy": "Bull Call Spread",
-                    "legs": [_leg("BUY", "CALL", buy_c, exp_long),
-                             _leg("SELL", "CALL", sell_c, exp_long)],
-                    "net_debit":  net_debit,
-                    "max_profit": max_profit,
-                    "width":      width,
-                    "quote_ts":   buy_c.get("quote_ts"),
-                    "summary": (f"📈 {ticker} Bull Call Spread: "
-                                f"Width: ${width:.0f}  "
-                                f"Buy ${buy_c['strike']:.0f}C / Sell ${sell_c['strike']:.0f}C "
-                                f"Exp {exp_long} | Debit ~${net_debit:.2f} | "
-                                f"Max Profit ~${max_profit:.2f} | {_iv_summary()}"),
-                    "alt": (f"Alt: Long ${buy_c['strike']:.0f} Call "
-                            f"@ ~${mid(buy_c):.2f} Exp {exp_short}"),
-                })
-        if not spread_ok:
-            c = buy_c or _pick(calls_s, current_price)
-            if c:
-                m = mid(c)
-                result.update({
-                    "strategy": "Long Call",
-                    "legs": [_leg("BUY", "CALL", c, exp_short)],
-                    "net_debit": m, "max_profit": None,
-                    "quote_ts":  c.get("quote_ts"),
-                    "summary": f"📈 {ticker} Long ${c['strike']:.0f} Call @ ~${m:.2f} Exp {exp_short} | {_iv_summary()}",
-                    "alt": "",
-                })
+        if put_credit_ok:
+            pass
+        else:
+            buy_c  = _pick(calls_l, current_price)
+            sell_c = _pick(calls_l, current_price * 1.03) if buy_c else None
+            if sell_c and buy_c and sell_c["strike"] == buy_c["strike"]:
+                sell_c = _pick([c for c in calls_l if c["strike"] > buy_c["strike"]],
+                               buy_c["strike"] + 1)
+
+            spread_ok = False
+            if buy_c and sell_c and sell_c["strike"] != buy_c["strike"]:
+                net_debit  = round(mid(buy_c) - mid(sell_c), 2)
+                width      = round(sell_c["strike"] - buy_c["strike"], 2)
+                max_profit = round(width - net_debit, 2)
+                if _validate_spread(net_debit, width):
+                    spread_ok = True
+                    result.update({
+                        "strategy": "Bull Call Spread",
+                        "legs": [_leg("BUY", "CALL", buy_c, exp_long),
+                                 _leg("SELL", "CALL", sell_c, exp_long)],
+                        "net_debit":  net_debit,
+                        "max_profit": max_profit,
+                        "width":      width,
+                        "quote_ts":   buy_c.get("quote_ts"),
+                        "summary": (f"📈 {ticker} Bull Call Spread: "
+                                    f"Width: ${width:.0f}  "
+                                    f"Buy ${buy_c['strike']:.0f}C / Sell ${sell_c['strike']:.0f}C "
+                                    f"Exp {exp_long} | Debit ~${net_debit:.2f} | "
+                                    f"Max Profit ~${max_profit:.2f} | {_iv_summary()}"),
+                        "alt": (f"Alt: Long ${buy_c['strike']:.0f} Call "
+                                f"@ ~${mid(buy_c):.2f} Exp {exp_short}"),
+                    })
+            if not spread_ok:
+                c = buy_c or _pick(calls_s, current_price)
+                if c:
+                    m = mid(c)
+                    result.update({
+                        "strategy": "Long Call",
+                        "legs": [_leg("BUY", "CALL", c, exp_short)],
+                        "net_debit": m, "max_profit": None,
+                        "quote_ts":  c.get("quote_ts"),
+                        "summary": f"📈 {ticker} Long ${c['strike']:.0f} Call @ ~${m:.2f} Exp {exp_short} | {_iv_summary()}",
+                        "alt": "",
+                    })
 
     elif is_bearish:
         buy_p  = _pick(puts_l, current_price)
@@ -990,15 +1094,27 @@ def _build_strategy(ticker: str, current_price: float, direction: str,
     if result.get("summary"):
         alt_lines = []
         if is_bullish:
-            zebra, butterfly = _call_zebra(), _call_butterfly()
-            ordered = (butterfly, zebra) if _prefer_butterfly() else (zebra, butterfly)
+            if OPTIONS_PREFER_PUTS and result.get("strategy") == "Bull Put Spread":
+                butterfly, condor = _put_butterfly(), _iron_condor()
+                ordered = (condor, butterfly)
+            else:
+                zebra, butterfly, condor = _call_zebra(), _call_butterfly(), _iron_condor()
+                ordered = (
+                    (butterfly, condor, zebra)
+                    if _prefer_butterfly()
+                    else (zebra, butterfly, condor)
+                )
             alt_lines.extend(x for x in ordered if x)
         elif is_bearish:
-            zebra, butterfly = _put_zebra(), _put_butterfly()
-            ordered = (butterfly, zebra) if _prefer_butterfly() else (zebra, butterfly)
+            zebra, butterfly, condor = _put_zebra(), _put_butterfly(), _iron_condor()
+            ordered = (
+                (butterfly, condor, zebra)
+                if _prefer_butterfly()
+                else (zebra, butterfly, condor)
+            )
             alt_lines.extend(x for x in ordered if x)
         else:
-            alt_lines.extend(x for x in (_call_zebra(), _put_zebra()) if x)
+            alt_lines.extend(x for x in (_iron_condor(), _call_zebra(), _put_zebra()) if x)
 
         existing_alt = result.get("alt")
         if existing_alt:

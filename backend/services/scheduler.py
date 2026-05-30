@@ -14,11 +14,13 @@ EPS poll logic (runs every 1 min, 3–6 PM CST):
 import logging
 import sys
 import os
-from datetime import date, datetime
+import json
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from backend.db.earnings_tracker import (
     init_db, init_watchlist, upsert_ticker, mark_pre_notified,
@@ -61,12 +63,53 @@ _SWEEP_DIGEST_ENABLED = _env_enabled("SWEEP_DIGEST_ENABLED", "1")
 _HOLDINGS_SUMMARY_ENABLED = _env_enabled("HOLDINGS_SUMMARY_ENABLED", "1")
 _HOLDINGS_EMAIL_ENABLED = _env_enabled("HOLDINGS_EMAIL_ENABLED", "1")
 _HOLDINGS_TELEGRAM_ENABLED = _env_enabled("HOLDINGS_TELEGRAM_ENABLED", "1")
+_NEWS_DIGEST_CATCHUP_ENABLED = _env_enabled("NEWS_DIGEST_CATCHUP_ENABLED", "1")
+try:
+    _NEWS_DIGEST_MAX_WORKERS = max(1, int(os.getenv("NEWS_DIGEST_MAX_WORKERS", "16")))
+except ValueError:
+    _NEWS_DIGEST_MAX_WORKERS = 16
 # Earnings jobs — pre-earnings discovery (8:30 CST) + EPS polling
 # (15:00–18:00 CST). Default OFF; set EARNINGS_JOBS_ENABLED=1 to re-enable.
 _EARNINGS_JOBS_ENABLED = _env_enabled("EARNINGS_JOBS_ENABLED", "0")
 # Regime-change Telegram alerts (verdict + γ flips). Default ON; set
 # MACRO_ALERTS_ENABLED=0 to silence.
 _MACRO_ALERTS_ENABLED  = _env_enabled("MACRO_ALERTS_ENABLED", "1")
+
+_SCHEDULER_STATE_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "db", "scheduler_state.json")
+)
+
+
+def _load_scheduler_state() -> dict:
+    try:
+        with open(_SCHEDULER_STATE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_scheduler_state(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_SCHEDULER_STATE_PATH), exist_ok=True)
+        tmp = f"{_SCHEDULER_STATE_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2, sort_keys=True)
+        os.replace(tmp, _SCHEDULER_STATE_PATH)
+    except Exception as exc:
+        logger.warning("[scheduler] state write failed: %s", exc)
+
+
+def _daily_job_sent(key: str, day: str | None = None) -> bool:
+    day = day or datetime.now(CST).date().isoformat()
+    return _load_scheduler_state().get(key) == day
+
+
+def _mark_daily_job_sent(key: str, day: str | None = None) -> None:
+    day = day or datetime.now(CST).date().isoformat()
+    state = _load_scheduler_state()
+    state[key] = day
+    _save_scheduler_state(state)
 
 
 # ── Message formatters ────────────────────────────────────────────────────────
@@ -902,10 +945,10 @@ NEWS_SCAN_LISTS: tuple[str, ...] = (
 )
 
 
-def news_summary_job(title: str = "News Digest"):
+def news_summary_job(title: str = "News Digest", state_key: str = "news_summary"):
     """8:00 AM CST — scan a fixed set of watchlists (default/tech/mega_cap/
     momentum/etfs) and Telegram a Good/Bad news digest."""
-    from backend.services.scanner import scan_single, WATCHLISTS, ETF_SECTORS
+    from backend.services.scanner import WATCHLISTS, ETF_SECTORS
     from backend.services.news_sentiment import get_news_details
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -935,50 +978,34 @@ def news_summary_job(title: str = "News Digest"):
 
     def _scan_with_news(ticker: str) -> dict:
         try:
-            row = scan_single(ticker)
+            details = get_news_details(ticker)
+            return {
+                "ticker": ticker,
+                "news": details.get("label", "No"),
+                "news_good": details.get("good_score", 0) or 0,
+                "news_bad": details.get("bad_score", 0) or 0,
+                "news_headlines": details.get("headlines") or [],
+                "verdict": "News",
+            }
         except Exception as exc:
-            logger.debug(f"[scheduler] scanner row failed for {ticker}: {exc}")
-            row = {"ticker": ticker}
-        row.setdefault("ticker", ticker)
-        if row.get("news") not in ("Good", "Bad"):
-            try:
-                details = get_news_details(ticker)
-                row["news"] = details.get("label", "No")
-                row["news_good"] = details.get("good_score", 0) or 0
-                row["news_bad"] = details.get("bad_score", 0) or 0
-                row["news_headlines"] = details.get("headlines") or []
-            except Exception as exc:
-                logger.debug(f"[scheduler] news lookup failed for {ticker}: {exc}")
-                row["news"] = "No"
+            logger.debug(f"[scheduler] news lookup failed for {ticker}: {exc}")
+            row = {"ticker": ticker, "news": "No", "verdict": "News"}
         row["_news_checked"] = True
         return row
 
     good: list[dict] = []
     bad:  list[dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=_NEWS_DIGEST_MAX_WORKERS) as pool:
         futures = {pool.submit(_scan_with_news, t): t for t in tickers}
         for fut in as_completed(futures):
             try:
                 r = fut.result()
             except Exception:
                 continue
-            if r.get("error") and r.get("news") not in ("Good", "Bad"):
-                continue
             label = r.get("news")
             g = r.get("news_good", 0) or 0
             b = r.get("news_bad", 0) or 0
             headlines = r.get("news_headlines") or []
-
-            if label not in ("Good", "Bad") and not r.get("_news_checked"):
-                try:
-                    details = get_news_details(t)
-                    label = details.get("label", "No")
-                    g = details.get("good_score", 0) or 0
-                    b = details.get("bad_score", 0) or 0
-                    headlines = details.get("headlines") or []
-                except Exception as exc:
-                    logger.debug(f"[scheduler] news lookup failed for {t}: {exc}")
-                    label = "No"
 
             if label not in ("Good", "Bad"):
                 continue
@@ -1037,7 +1064,11 @@ def news_summary_job(title: str = "News Digest"):
     )
     if title != "News Digest":
         msg = msg.replace("<b>News Digest", f"<b>{html.escape(title)}", 1)
-    send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+    sent_ok = send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+    if sent_ok:
+        _mark_daily_job_sent(state_key)
+    else:
+        logger.warning("[scheduler] news summary telegram send failed")
     # Diagnostic: count non-empty headlines actually rendered so we can spot
     # the "white bubbles, no text" regression at a glance.
     _hl_total = sum(
@@ -1047,14 +1078,46 @@ def news_summary_job(title: str = "News Digest"):
         if (hd.get("h") or "").strip()
     )
     logger.info(
-        f"[scheduler] news summary sent: {len(good)} good / {len(bad)} bad "
+        f"[scheduler] news summary completed: telegram={sent_ok} "
+        f"{len(good)} good / {len(bad)} bad "
         f"(top 3 each with details) — {_hl_total} headline lines rendered"
     )
 
 
 def post_market_news_summary_job():
     """After market close: send the Good/Bad news digest again."""
-    news_summary_job("Post-Market News Digest")
+    news_summary_job("Post-Market News Digest", state_key="news_summary_post_market")
+
+
+def schedule_news_summary_startup_catchup():
+    """Queue one catch-up morning digest if the app starts after 8:00 CST."""
+    if not _NEWS_DIGEST_CATCHUP_ENABLED:
+        return
+    now = datetime.now(CST)
+
+    morning_at = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    cutoff_at = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if not (morning_at <= now < cutoff_at):
+        return
+
+    day = now.date().isoformat()
+    if _daily_job_sent("news_summary", day):
+        logger.info("[scheduler] news summary catch-up skipped: already sent for %s", day)
+        return
+
+    run_at = now + timedelta(seconds=20)
+    scheduler.add_job(
+        news_summary_job,
+        DateTrigger(run_date=run_at, timezone=CST),
+        id="news_summary_startup_catchup",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        kwargs={"title": "News Digest (Catch-up)", "state_key": "news_summary"},
+    )
+    logger.info(
+        "[scheduler] news summary catch-up queued for %s (missed 08:00 CST)",
+        run_at.isoformat(),
+    )
 
 
 def telegram_watchlist_job():
@@ -1495,6 +1558,8 @@ def setup_scheduler():
         replace_existing=True,
         misfire_grace_time=3600,
     )
+
+    schedule_news_summary_startup_catchup()
 
     # Gamma refreshes twice on trading days: after open and after close.
     # SPY runs a few minutes before sectors so provider calls are staggered.

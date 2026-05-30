@@ -1101,30 +1101,56 @@ def _valuation_estimate(f: dict) -> dict:
     total_cash = _num(f.get("total_cash"))
     market_cap_raw = _num(f.get("market_cap_raw"))
     ps_ratio = _num(f.get("price_to_sales"))
+    spec_score = 0.0
+    spec_bits: list[str] = []
+    if revenue_growth is not None:
+        if revenue_growth >= 0.25:
+            spec_score += 2.0
+            spec_bits.append(f"Rev growth {revenue_growth * 100:+.0f}%")
+        elif revenue_growth >= 0.08:
+            spec_score += 1.0
+            spec_bits.append(f"Rev growth {revenue_growth * 100:+.0f}%")
+    if market_cap_raw is not None and market_cap_raw <= 20e9:
+        spec_score += 1.0
+        spec_bits.append(
+            f"Cap ${market_cap_raw/1e9:.1f}B" if market_cap_raw >= 1e9
+            else f"Cap ${market_cap_raw/1e6:.0f}M"
+        )
+    if debt_to_equity is not None and debt_to_equity <= 100:
+        spec_score += 1.0
+        spec_bits.append(f"D/E {debt_to_equity:.0f}%")
+    if total_cash is not None and total_cash > 0:
+        spec_score += 1.0
+        spec_bits.append(
+            f"Cash ${total_cash/1e9:.1f}B" if total_cash >= 1e9
+            else f"Cash ${total_cash/1e6:.0f}M"
+        )
+    if ps_ratio is not None and 0 < ps_ratio <= 25:
+        spec_score += 1.0
+        spec_bits.append(f"P/S {ps_ratio:.1f}x")
+    if analyst_upside_pct is not None:
+        if analyst_upside_pct >= 20:
+            spec_score += 1.0
+            spec_bits.append(f"Target {analyst_upside_pct:+.0f}%")
+        elif analyst_upside_pct >= 10:
+            spec_score += 0.5
+            spec_bits.append(f"Target {analyst_upside_pct:+.0f}%")
     if (
         not cyclical_peak_risk
         and not long_runway
-        and revenue_growth is not None and revenue_growth >= 0.25
+        and spec_score >= 5
+        and (
+            (revenue_growth is not None and revenue_growth >= 0.08)
+            or (analyst_upside_pct is not None and analyst_upside_pct >= 20)
+        )
         and (market_cap_raw is None or market_cap_raw <= 20e9)
-        and (debt_to_equity is None or debt_to_equity <= 100)
+        and (debt_to_equity is None or debt_to_equity <= 150)
         and (total_cash is None or total_cash > 0)
         and (ps_ratio is None or 0 < ps_ratio <= 25)
     ):
         multi_bagger = True
-        bits = [f"Rev growth {revenue_growth * 100:+.0f}%"]
-        if market_cap_raw is not None:
-            bits.append(
-                f"Cap ${market_cap_raw/1e9:.1f}B" if market_cap_raw >= 1e9
-                else f"Cap ${market_cap_raw/1e6:.0f}M"
-            )
-        if ps_ratio is not None:
-            bits.append(f"P/S {ps_ratio:.1f}x")
-        if total_cash is not None and total_cash > 0:
-            bits.append(
-                f"Cash ${total_cash/1e9:.1f}B" if total_cash >= 1e9
-                else f"Cash ${total_cash/1e6:.0f}M"
-            )
-        multi_bagger_reason = "Speculative growth — " + " | ".join(bits)
+        bits = spec_bits
+        multi_bagger_reason = "Speculative upside - " + " | ".join(bits)
 
     reason = " | ".join(reasons[:7]) if reasons else "Insufficient valuation fundamentals"
     return {

@@ -401,12 +401,12 @@ function fundamentalStyle(signal: string) {
   };
 }
 
-function fundamentalDotStyle(signal: string) {
+function fundamentalChipStyle(signal: string) {
   const style = fundamentalStyle(signal);
   return {
-    backgroundColor: style.color,
+    color: style.color,
     borderColor: style.borderColor,
-    boxShadow: `0 0 8px ${style.backgroundColor}`,
+    backgroundColor: style.backgroundColor,
   };
 }
 
@@ -2297,17 +2297,21 @@ export default function ScannerPage() {
                   const optEmoji = r.opt_strategy?.includes("Bull") ? "📈"
                                  : r.opt_strategy?.includes("Bear") ? "📉"
                                  : r.opt_strategy?.includes("Butterfly") ? "🦋"
+                                 : r.opt_strategy?.includes("Condor") ? "🦋"
                                  : r.opt_strategy?.includes("Straddle") ? "🦋"
                                  : r.opt_strategy ? "📊" : null;
                   const optShort = r.opt_strategy
-                    ?.replace("Bull Call Spread", "BCS")
+                    ?.replace("Bull Put Spread",  "Bull Put")
+                     .replace("Bull Call Spread", "BCS")
                      .replace("Bear Put Spread",  "BPS")
                      .replace("Iron Butterfly",   "Iron Fly")
+                     .replace("Iron Condor",      "Condor")
                      .replace("Long Call",        "Long C")
                      .replace("Long Put",         "Long P");
                   const optAltText = `${r.opt_summary ?? ""}\n${r.opt_alt ?? ""}`;
                   const hasZebra = optAltText.includes("ZEBRA");
                   const hasButterflyAlt = optAltText.includes("Butterfly") && !r.opt_strategy?.includes("Butterfly");
+                  const hasCondorAlt = optAltText.includes("Iron Condor") && !r.opt_strategy?.includes("Condor");
                   const topCall = r.opt_liquid?.find(c => c.type === "CALL");
                   const topPut = r.opt_liquid?.find(c => c.type === "PUT");
                   const hasOtmData = topCall || topPut;
@@ -2488,16 +2492,26 @@ export default function ScannerPage() {
                           <span className="text-muted/40 text-xs">—</span>
                         )}
                         {r.signals && (
-                          <div className="mt-1 flex max-w-[90px] flex-wrap justify-center gap-1 leading-tight whitespace-normal" title={r.signals}>
-                            {r.signals.split(" | ").map((signal, idx) => (
+                          <div className="mt-1 flex max-w-[140px] flex-wrap justify-center gap-1 leading-tight whitespace-normal" title={r.signals}>
+                            {r.signals.split(" | ").slice(0, 4).map((signal, idx) => (
                               <span
                                 key={`${r.ticker}-signal-${idx}`}
-                                className="inline-block h-2.5 w-2.5 rounded-full border cursor-help"
-                                style={fundamentalDotStyle(signal)}
+                                className="max-w-[132px] rounded border px-1 py-0.5 text-[8px] font-mono font-semibold leading-tight break-words cursor-help"
+                                style={fundamentalChipStyle(signal)}
                                 title={signal}
                                 aria-label={signal}
-                              />
+                              >
+                                {signal}
+                              </span>
                             ))}
+                            {r.signals.split(" | ").length > 4 && (
+                              <span
+                                className="rounded border border-border bg-surface px-1 py-0.5 text-[8px] font-mono text-muted cursor-help"
+                                title={r.signals}
+                              >
+                                +{r.signals.split(" | ").length - 4}
+                              </span>
+                            )}
                           </div>
                         )}
                         <div className="mt-1 flex flex-col items-center gap-0.5">
@@ -3142,6 +3156,9 @@ export default function ScannerPage() {
                               {hasButterflyAlt && (
                                 <span className="text-yellow ml-1">Fly</span>
                               )}
+                              {hasCondorAlt && (
+                                <span className="text-green ml-1">IC</span>
+                              )}
                             </span>
                             <span className="text-muted/40 text-[10px]">⤢</span>
                           </span>
@@ -3284,7 +3301,7 @@ export default function ScannerPage() {
               autoFocus
               onFocus={e => e.target.select()}
               value={[optModal.r.opt_summary, optModal.r.opt_alt].filter(Boolean).join("\n\n")}
-              rows={7}
+              rows={10}
               className="w-full bg-surface border border-border rounded-lg p-3 text-sm font-mono text-white resize-none focus:outline-none focus:border-accent"
             />
             <div className="flex justify-end gap-2">
