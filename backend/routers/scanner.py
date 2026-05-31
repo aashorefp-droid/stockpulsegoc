@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from backend.services.scanner import (
     WATCHLISTS, SWING_UNIVERSE_PRESETS, scan_single, get_short_squeeze_tickers,
-    get_swing_universe_tickers, get_telegram_watchlist,
+    get_swing_universe_tickers, get_telegram_watchlist, get_earnings_watchlist,
 )
 from backend.db.holdings_store import get_holdings_tickers, load_holdings, save_holdings
 
@@ -25,6 +25,10 @@ def get_watchlists():
     out = {k: len(v) for k, v in WATCHLISTS.items()}
     out.update({k: int(v.get("limit", 0)) for k, v in SWING_UNIVERSE_PRESETS.items()})
     out["holdings"] = len(get_holdings_tickers())
+    try:
+        out["earnings"] = len(get_earnings_watchlist())
+    except Exception:
+        out["earnings"] = 0
     return out
 
 
@@ -155,7 +159,7 @@ async def seasonality(ticker: str = Query(...)):
 
 @router.post("/telegram/refresh")
 async def refresh_telegram_watchlist():
-    """Force an immediate TOS-scan Gmail pull (don't wait for the 7:15 PM job)."""
+    """Force an immediate TOS-scan Gmail pull (don't wait for the Saturday 7:15 PM job)."""
     loop = asyncio.get_event_loop()
 
     def _do():
@@ -178,6 +182,27 @@ def get_scanner_snapshot(
     from backend.services.scanner_snapshot import load_snapshot
 
     return load_snapshot(watchlist, day=day)
+
+
+@router.get("/snapshots")
+def list_scanner_snapshots(watchlist: Optional[str] = Query(None)):
+    """Return saved scanner snapshot metadata."""
+    from backend.services.scanner_snapshot import list_snapshots
+
+    return list_snapshots(watchlist)
+
+
+@router.post("/snapshot/save")
+def save_scanner_snapshot(payload: dict = Body(...)):
+    """Persist the current scanner results without rerunning the scan."""
+    from backend.services.scanner_snapshot import save_snapshot
+
+    watchlist = str(payload.get("watchlist") or "custom").strip().lower()
+    day = payload.get("day") or None
+    results = payload.get("results") or []
+    if not isinstance(results, list):
+        raise HTTPException(status_code=400, detail="results must be a list")
+    return save_snapshot(watchlist, results, day=day)
 
 
 @router.post("/snapshot/run")
@@ -260,6 +285,9 @@ async def stream_scan(
     elif watchlist == "holdings":
         loop = asyncio.get_event_loop()
         ticker_list = await loop.run_in_executor(None, get_holdings_tickers)
+    elif watchlist == "earnings":
+        loop = asyncio.get_event_loop()
+        ticker_list = await loop.run_in_executor(None, get_earnings_watchlist)
     elif watchlist in SWING_UNIVERSE_PRESETS:
         loop = asyncio.get_event_loop()
         ticker_list = await loop.run_in_executor(None, get_swing_universe_tickers, watchlist)

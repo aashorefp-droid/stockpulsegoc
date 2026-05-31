@@ -1,9 +1,9 @@
 """
 telegram_watchlist.py — Poll a Telegram bot for tickers, persist them locally.
 
-Ported from the root stock_pulse project. The scheduler calls poll_and_store()
-once at startup and again daily at ~8 PM CST; the scanner's "telegram"
-watchlist option then serves fetch_today_watchlist().
+Ported from the root stock_pulse project. Kept as a legacy Telegram polling
+source; the active scanner "telegram" watchlist now comes from the TOS/Gmail
+watchlist reader and is scheduled weekly on Saturday.
 
   - poll_and_store()        — getUpdates, acknowledge via offset, append to a
                               local JSON store (messages are saved before the

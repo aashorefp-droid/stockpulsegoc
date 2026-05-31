@@ -81,7 +81,7 @@ export default function PostEarningsPage() {
         setError(
           trimmed
             ? "No earnings data found for those tickers on this date."
-            : "No earnings reporters found in our watchlist. Try entering tickers manually."
+            : "No earnings reporters found for that date. Try entering tickers manually."
         );
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Unknown error");
@@ -145,7 +145,7 @@ export default function PostEarningsPage() {
           <p className="text-xs text-[#8b949e] animate-pulse mt-3">
             {tickersInput.trim()
               ? "Running backtest per ticker…"
-              : "Scanning earnings calendar then running backtests… (15–20 s)"}
+              : "Checking the earnings calendar then running backtests…"}
           </p>
         )}
       </div>

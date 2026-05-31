@@ -38,9 +38,9 @@ def configured_watchlists() -> list[str]:
 
 def retention_days() -> int:
     try:
-        return int(os.getenv("SCANNER_SNAPSHOT_RETENTION_DAYS", "10"))
+        return int(os.getenv("SCANNER_SNAPSHOT_RETENTION_DAYS", "7"))
     except ValueError:
-        return 10
+        return 7
 
 
 def _tickers_for_watchlist(watchlist: str) -> list[str]:
@@ -48,12 +48,15 @@ def _tickers_for_watchlist(watchlist: str) -> list[str]:
     from backend.services.scanner import (
         WATCHLISTS,
         SWING_UNIVERSE_PRESETS,
+        get_earnings_watchlist,
         get_swing_universe_tickers,
     )
 
     key = (watchlist or "").strip().lower()
     if key == "holdings":
         tickers = get_holdings_tickers()
+    elif key == "earnings":
+        tickers = get_earnings_watchlist()
     elif key in SWING_UNIVERSE_PRESETS:
         tickers = get_swing_universe_tickers(key)
     else:
@@ -108,6 +111,36 @@ def refresh_snapshot(watchlist: str = "default", *, day: Optional[str] = None) -
     return {"available": True, "store": scanner_snapshot_store.backend_name(), **saved}
 
 
+def save_snapshot(
+    watchlist: str,
+    results: list[dict],
+    *,
+    day: Optional[str] = None,
+) -> dict:
+    """Persist an already-scanned result set without rerunning the scanner."""
+    key = (watchlist or "").strip().lower() or "custom"
+    clean_results = [r for r in results if isinstance(r, dict)]
+    saved = scanner_snapshot_store.save_snapshot(
+        key,
+        day or _market_day(),
+        clean_results,
+    )
+    prune_snapshots()
+    return {"available": True, "store": scanner_snapshot_store.backend_name(), **saved}
+
+
+def list_snapshots(watchlist: Optional[str] = None) -> dict:
+    key = (watchlist or "").strip().lower() or None
+    rows = scanner_snapshot_store.list_snapshots(key)
+    return {
+        "available": bool(rows),
+        "count": len(rows),
+        "retention_days": retention_days(),
+        "store": scanner_snapshot_store.backend_name(),
+        "snapshots": rows,
+    }
+
+
 def refresh_snapshots(
     watchlists: Optional[Iterable[str]] = None,
     *,
@@ -155,7 +188,7 @@ def prune_snapshots(
     watchlists: Optional[Iterable[str]] = None,
 ) -> dict:
     keep_days = retention_days() if days is None else days
-    keys = list(watchlists or configured_watchlists())
+    keys = list(watchlists) if watchlists is not None else []
     deleted = scanner_snapshot_store.prune_old_snapshots(keep_days, keys)
     return {
         "retention_days": keep_days,

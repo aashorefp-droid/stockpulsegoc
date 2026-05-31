@@ -12,19 +12,20 @@ const WATCHLISTS = [
   { key: "mega_cap",      label: "Mega Cap 20",       count: 20  },
   { key: "momentum",      label: "Momentum 20",       count: 20  },
   { key: "etfs",          label: "ETFs 56",           count: 56  },
+  { key: "earnings",      label: "Earnings",           count: 15  },
   { key: "short_squeeze", label: "🔥 Short Squeeze",  count: 40  },
-  { key: "telegram",      label: "📧 TOS Scan (7 PM)", count: 25 },
+  { key: "telegram",      label: "📧 TOS Scan (Sat)", count: 25 },
   { key: "holdings",      label: "Holdings",           count: 0   },
   { key: "nyse_swing",    label: "🏛 NYSE Swing >$10", count: 200 },
   { key: "nasdaq_swing",  label: "💻 NASDAQ Swing >$10", count: 200 },
   { key: "custom",        label: "Custom",            count: 0   },
 ];
 
-type Filter = "all" | "actionable" | "rank1" | "exceptional" | "high_short" | "day_spring" | "lt_spring" | "sweep_reclaim_long" | "sweep_reclaim_short" | "breakout" | "prebreakout" | "quality_long" | "btd" | "btd_trigger" | "speculative" | "news_good" | "news_bad";
+type Filter = "all" | "actionable" | "rank1" | "exceptional" | "high_short" | "day_spring" | "lt_spring" | "w30ma_curl" | "sweep_reclaim_long" | "sweep_reclaim_short" | "breakout" | "prebreakout" | "quality_long" | "btd" | "btd_trigger" | "speculative" | "news_good" | "news_bad";
 
 const isBtdLive = (s?: string) => s === "TRIGGER" || s === "ARMED" || s === "ARMED-DEEP";
 type SortBy = "score" | "grade" | "rr" | "swingReward" | "fibReward" | "dayReward" | "ltEntryPct" | "valuation" | "longRunway" | "cyclicalPeak" | "multiBagger" | "newsGood" | "newsBad";
-type ScannerMode = "overview" | "swing" | "longterm" | "fib" | "daytrading" | "options";
+type ScannerMode = "overview" | "swing" | "longterm" | "fib" | "daytrading" | "options" | "snapshots";
 
 const SCANNER_MODES: { key: ScannerMode; label: string; title: string; sort: SortBy }[] = [
   { key: "overview",   label: "Overview",  title: "Full scanner with every column group", sort: "score" },
@@ -33,6 +34,7 @@ const SCANNER_MODES: { key: ScannerMode; label: string; title: string; sort: Sor
   { key: "fib",        label: "Fib",       title: "Fib target, ladders, earnings swing zones", sort: "fibReward" },
   { key: "daytrading", label: "Day V4",    title: "CPR, next-day, and Day Trading V4 plans", sort: "dayReward" },
   { key: "options",    label: "Options",   title: "Options strategy and OTM liquidity", sort: "score" },
+  { key: "snapshots",  label: "Snapshots", title: "Save, load, and delete persistent scanner snapshots", sort: "score" },
 ];
 
 type Seasonality = {
@@ -328,6 +330,21 @@ interface ScanResult {
   done?:         boolean;
   total?:        number;
 }
+
+type SnapshotMeta = {
+  watchlist: string;
+  date: string;
+  created_at?: string | null;
+  count: number;
+};
+
+type EarningsPlaceholderRow = {
+  date: string;
+  ticker: string;
+  source?: string;
+  created_at?: string | null;
+  expires_at?: string | null;
+};
 
 const verdictColor: Record<string, string> = {
   "BULLISH":      "text-green",
@@ -725,6 +742,37 @@ function prevTradingDay(dateStr: string): { date: string; note: string | null } 
   return { date: dateStr, note: null };
 }
 
+function localIsoDate(offsetDays = 0): string {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 10);
+}
+
+function parseDatedEarningsRows(text: string): { date: string; tickers: string[] }[] | null {
+  const rows: { date: string; tickers: string[] }[] = [];
+  let sawDate = false;
+  text.split(/\r?\n/).forEach(line => {
+    const m = line.match(/^\s*(\d{4}-\d{2}-\d{2})\s*[:,-]\s*(.+)$/);
+    if (!m) return;
+    sawDate = true;
+    const tickers = m[2]
+      .split(/[\s,;]+/)
+      .map(t => t.trim().toUpperCase().replace(/^\$/, ""))
+      .filter(t => /^[A-Z][A-Z0-9.-]{0,14}$/.test(t));
+    if (tickers.length) rows.push({ date: m[1], tickers });
+  });
+  return sawDate ? rows : null;
+}
+
+function countEarningsInputTickers(text: string): number {
+  const dated = parseDatedEarningsRows(text);
+  const values = dated
+    ? dated.flatMap(row => row.tickers)
+    : text.split(/[\s,;]+/).map(t => t.trim().toUpperCase().replace(/^\$/, ""));
+  return new Set(values.filter(t => /^[A-Z][A-Z0-9.-]{0,14}$/.test(t))).size;
+}
+
 export default function ScannerPage() {
   const [watchlist,    setWatchlist]    = useState("default");
   const [watchlistsOpen, setWatchlistsOpen] = useState(false);
@@ -735,6 +783,12 @@ export default function ScannerPage() {
   const [holdingsTickers, setHoldingsTickers] = useState<string[]>([]);
   const [holdingsSaving, setHoldingsSaving] = useState(false);
   const [holdingsMsg, setHoldingsMsg] = useState("");
+  const [earningsInput, setEarningsInput] = useState("");
+  const [earningsStartDate, setEarningsStartDate] = useState(() => localIsoDate());
+  const [earningsDays, setEarningsDays] = useState(7);
+  const [earningsRows, setEarningsRows] = useState<EarningsPlaceholderRow[]>([]);
+  const [earningsBusy, setEarningsBusy] = useState(false);
+  const [earningsMsg, setEarningsMsg] = useState("");
   const [tickerFilter, setTickerFilter] = useState("");
   const [scanning,     setScanning]     = useState(false);
   const [results,      setResults]      = useState<ScanResult[]>([]);
@@ -758,14 +812,17 @@ export default function ScannerPage() {
   const [sortBy,       setSortBy]       = useState<SortBy>("score");
   const selectScannerMode = (next: ScannerMode) => {
     if (next === scannerMode) return;
+    const keepCurrentScan = next === "snapshots" || scannerMode === "snapshots";
     setScannerMode(next);
     setFilters(new Set());
     setSortBy(SCANNER_MODES.find(m => m.key === next)?.sort ?? "score");
-    setResults([]);
-    setPooled([]);
-    setProgress({ done: 0, total: 0 });
+    if (!keepCurrentScan) {
+      setResults([]);
+      setPooled([]);
+      setProgress({ done: 0, total: 0 });
+      setActiveBacktestDate(null);
+    }
     setSnapshotStatus("");
-    setActiveBacktestDate(null);
   };
   const [optModal,     setOptModal]     = useState<{ r: ScanResult } | null>(null);
   const [otmModal,     setOtmModal]     = useState<{ r: ScanResult } | null>(null);
@@ -819,6 +876,7 @@ export default function ScannerPage() {
       }
     }
     loadHoldings();
+    loadEarningsPlaceholders();
     return () => { alive = false; };
   }, []);
 
@@ -1057,12 +1115,122 @@ export default function ScannerPage() {
   // Watchlists with daily-saved snapshots — load instantly instead of running a live scan.
   const SNAPSHOT_WATCHLISTS = ["default", "momentum"];
   const [snapshotStatus, setSnapshotStatus] = useState<string>("");
+  const [snapshotRows, setSnapshotRows] = useState<SnapshotMeta[]>([]);
+  const [snapshotBusy, setSnapshotBusy] = useState(false);
+  const [snapshotMsg, setSnapshotMsg] = useState("");
 
   async function fetchSnapshot(key: string) {
-    const res = await fetch(`${API_BASE}/api/scanner/snapshot?watchlist=${key}`);
+    const res = await fetch(`${API_BASE}/api/scanner/snapshot?watchlist=${encodeURIComponent(key)}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
   }
+
+  async function refreshSnapshotRows() {
+    setSnapshotBusy(true);
+    setSnapshotMsg("Loading snapshots...");
+    try {
+      const res = await fetch(`${API_BASE}/api/scanner/snapshots`);
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+      const rows = Array.isArray(json?.snapshots) ? json.snapshots : [];
+      setSnapshotRows(rows);
+      setSnapshotMsg(rows.length ? `${rows.length} saved · auto-delete after ${json?.retention_days ?? 7} days` : "No saved snapshots");
+    } catch (e: any) {
+      setSnapshotMsg(`Snapshot load failed: ${e?.message ?? e}`);
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
+  async function saveCurrentSnapshot() {
+    const rows = results.filter(r => !r.done);
+    if (!rows.length) {
+      setSnapshotMsg("Run or load a scan first, then save it.");
+      return;
+    }
+    setSnapshotBusy(true);
+    setSnapshotMsg("Saving current scan...");
+    try {
+      const payload = {
+        watchlist,
+        day: activeBacktestDate ?? undefined,
+        results: rows,
+      };
+      const res = await fetch(`${API_BASE}/api/scanner/snapshot/save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+      setSnapshotMsg(`Saved ${json.count ?? rows.length} rows for ${json.watchlist} ${json.date}`);
+      await refreshSnapshotRows();
+    } catch (e: any) {
+      setSnapshotMsg(`Snapshot save failed: ${e?.message ?? e}`);
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
+  async function loadSavedSnapshot(row: SnapshotMeta) {
+    setSnapshotBusy(true);
+    setSnapshotMsg(`Loading ${row.watchlist} ${row.date}...`);
+    try {
+      const res = await fetch(`${API_BASE}/api/scanner/snapshot?watchlist=${encodeURIComponent(row.watchlist)}&day=${encodeURIComponent(row.date)}`);
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.available) throw new Error(json?.error || json?.detail || `HTTP ${res.status}`);
+      setWatchlist(row.watchlist);
+      setResults(Array.isArray(json.results) ? json.results : []);
+      setProgress({ done: json.count ?? 0, total: json.count ?? 0 });
+      setActiveBacktestDate(json.date ?? row.date);
+      setScannerMode("overview");
+      setScannerCollapsed(true);
+      setSnapshotMsg(`Loaded ${row.watchlist} ${row.date}`);
+    } catch (e: any) {
+      setSnapshotMsg(`Snapshot load failed: ${e?.message ?? e}`);
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
+  async function deleteSavedSnapshot(row: SnapshotMeta) {
+    setSnapshotBusy(true);
+    setSnapshotMsg(`Deleting ${row.watchlist} ${row.date}...`);
+    try {
+      const res = await fetch(`${API_BASE}/api/scanner/snapshot?watchlist=${encodeURIComponent(row.watchlist)}&day=${encodeURIComponent(row.date)}`, {
+        method: "DELETE",
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+      setSnapshotMsg(`Deleted ${json.deleted ?? 0} snapshot`);
+      await refreshSnapshotRows();
+    } catch (e: any) {
+      setSnapshotMsg(`Snapshot delete failed: ${e?.message ?? e}`);
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
+  async function pruneSavedSnapshots() {
+    setSnapshotBusy(true);
+    setSnapshotMsg("Deleting snapshots older than 7 days...");
+    try {
+      const res = await fetch(`${API_BASE}/api/scanner/snapshot/prune?days=7`, { method: "POST" });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+      setSnapshotMsg(`Pruned ${json.deleted ?? 0} old snapshot${json.deleted === 1 ? "" : "s"}`);
+      await refreshSnapshotRows();
+    } catch (e: any) {
+      setSnapshotMsg(`Snapshot prune failed: ${e?.message ?? e}`);
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (scannerMode === "snapshots") refreshSnapshotRows();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scannerMode]);
 
   async function loadSnapshot(key: string) {
     let fallbackToLive = false;
@@ -1110,18 +1278,24 @@ export default function ScannerPage() {
   }
 
   function startScan(scanWatchlist: string = watchlist, forceLive = false) {
+    const scanMode = scannerMode === "snapshots" ? "overview" : scannerMode;
     if (esRef.current) esRef.current.close();
     if (refresh15mRef.current) refresh15mRef.current.close();
     refresh15mBusyRef.current = false;
     setAuto15mStatus("");
-    setSnapshotStatus(forceLive ? "Live scan running while snapshot finishes." : "");
+    const dynamicSwing = scanWatchlist === "nyse_swing" || scanWatchlist === "nasdaq_swing";
+    setSnapshotStatus(forceLive
+      ? "Live scan running while snapshot finishes."
+      : dynamicSwing
+        ? "Building swing universe from live market data..."
+        : "");
     setScannerCollapsed(false);
     if (scanWatchlist === "custom" && watchlist !== "custom") {
       setWatchlist("custom");
     }
 
     // For saved daily snapshots in live mode, prefer the Neon-backed snapshot (faster).
-    if (!forceLive && mode === "live" && scannerMode === "overview" && SNAPSHOT_WATCHLISTS.includes(scanWatchlist)) {
+    if (!forceLive && mode === "live" && scanMode === "overview" && SNAPSHOT_WATCHLISTS.includes(scanWatchlist)) {
       loadSnapshot(scanWatchlist);
       return;
     }
@@ -1135,12 +1309,14 @@ export default function ScannerPage() {
       const tickers = customInput.split(",").map(t => t.trim().toUpperCase()).filter(Boolean);
       if (!tickers.length) return;
       total = tickers.length;
-      url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scannerMode)}&tickers=${encodeURIComponent(tickers.join(","))}`;
+      url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scanMode)}&tickers=${encodeURIComponent(tickers.join(","))}`;
     } else {
       total = scanWatchlist === "holdings"
         ? holdingsTickers.length
-        : WATCHLISTS.find(w => w.key === scanWatchlist)?.count ?? 50;
-      url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scannerMode)}&watchlist=${scanWatchlist}`;
+        : scanWatchlist === "earnings"
+          ? (earningsSavedTickerCount || WATCHLISTS.find(w => w.key === scanWatchlist)?.count || 0)
+          : WATCHLISTS.find(w => w.key === scanWatchlist)?.count ?? 50;
+      url = `${API_BASE}/api/scanner/stream?mode=${encodeURIComponent(scanMode)}&watchlist=${scanWatchlist}`;
     }
 
     if (mode === "backtest" && backtestDate) {
@@ -1170,6 +1346,7 @@ export default function ScannerPage() {
         es.close();
         return;
       }
+      if (dynamicSwing && progress.done === 0) setSnapshotStatus("");
       setResults(prev => [...prev, data]);
       setProgress(p => ({ ...p, done: p.done + 1 }));
     };
@@ -1184,6 +1361,112 @@ export default function ScannerPage() {
   function stopScan() {
     esRef.current?.close();
     setScanning(false);
+  }
+
+  async function loadEarningsPlaceholders() {
+    setEarningsBusy(true);
+    setEarningsMsg("Loading...");
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/earnings/placeholders?start_date=${encodeURIComponent(earningsStartDate)}&days=${earningsDays}`
+      );
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+      const rows = Array.isArray(json?.rows) ? json.rows : [];
+      setEarningsRows(rows);
+      const unique = new Set(rows.map((r: EarningsPlaceholderRow) => r.ticker)).size;
+      setEarningsMsg(unique ? `Loaded ${unique} tickers / ${rows.length} rows` : "No saved earnings rows");
+    } catch (e: any) {
+      setEarningsMsg(`Load failed: ${e?.message ?? e}`);
+    } finally {
+      setEarningsBusy(false);
+    }
+  }
+
+  async function saveEarningsPlaceholders() {
+    const input = earningsInput.trim();
+    if (!input) {
+      setEarningsMsg("Paste tickers first.");
+      return;
+    }
+    const datedRows = parseDatedEarningsRows(input);
+    if (datedRows && datedRows.length === 0) {
+      setEarningsMsg("No valid dated ticker rows found.");
+      return;
+    }
+    setEarningsBusy(true);
+    setEarningsMsg("Saving...");
+    try {
+      const payload = datedRows
+        ? {
+            rows: datedRows,
+            source: "scanner-weekly",
+            replace: true,
+            keep_after_days: 2,
+          }
+        : {
+            start_date: earningsStartDate,
+            days: earningsDays,
+            tickers: input,
+            source: "scanner-weekly",
+            replace: true,
+            keep_after_days: 2,
+          };
+      const res = await fetch(`${API_BASE}/api/earnings/placeholders/save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+      const tickerCount = Array.isArray(json?.tickers) ? json.tickers.length : countEarningsInputTickers(input);
+      setEarningsMsg(`Saved ${tickerCount} tickers / ${json?.count ?? 0} rows`);
+      setWatchlist("earnings");
+      await loadEarningsPlaceholders();
+    } catch (e: any) {
+      setEarningsMsg(`Save failed: ${e?.message ?? e}`);
+    } finally {
+      setEarningsBusy(false);
+    }
+  }
+
+  async function purgeEarningsPlaceholders() {
+    setEarningsBusy(true);
+    setEarningsMsg("Purging...");
+    try {
+      const res = await fetch(`${API_BASE}/api/earnings/placeholders/purge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keep_after_days: 2 }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+      setEarningsMsg(`Purged ${json?.deleted ?? 0} rows older than ${json?.cutoff_exclusive ?? "cutoff"}`);
+      await loadEarningsPlaceholders();
+    } catch (e: any) {
+      setEarningsMsg(`Purge failed: ${e?.message ?? e}`);
+    } finally {
+      setEarningsBusy(false);
+    }
+  }
+
+  async function dropEarningsPlaceholders() {
+    setEarningsBusy(true);
+    setEarningsMsg("Dropping...");
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/earnings/placeholders?start_date=${encodeURIComponent(earningsStartDate)}&days=${earningsDays}`,
+        { method: "DELETE" }
+      );
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.detail || `HTTP ${res.status}`);
+      setEarningsMsg(`Dropped ${json?.deleted ?? 0} rows`);
+      await loadEarningsPlaceholders();
+    } catch (e: any) {
+      setEarningsMsg(`Drop failed: ${e?.message ?? e}`);
+    } finally {
+      setEarningsBusy(false);
+    }
   }
 
   async function saveHoldings() {
@@ -1359,6 +1642,7 @@ export default function ScannerPage() {
       case "btd_trigger":         return r.btd_state === "TRIGGER";
       case "day_spring":          return !!r.day_spring;
       case "lt_spring":           return !!r.long_term_spring;
+      case "w30ma_curl":          return !!r.w30ma_curl;
       case "sweep_reclaim_long":  return isSweepReclaimLong(r);
       case "sweep_reclaim_short": return isSweepReclaimShort(r);
       case "breakout":            return isBreakout(r);
@@ -1411,11 +1695,21 @@ export default function ScannerPage() {
   const selectedScannerMode = SCANNER_MODES.find(m => m.key === scannerMode) ?? SCANNER_MODES[0];
   const customTickerCount = customInput.split(",").filter(t => t.trim()).length;
   const holdingsTickerCount = holdingsTickers.length;
+  const earningsInputTickerCount = countEarningsInputTickers(earningsInput);
+  const earningsSavedTickerCount = new Set(earningsRows.map(r => r.ticker)).size;
+  const earningsRowsByDate = earningsRows.reduce<Record<string, string[]>>((acc, row) => {
+    const day = row.date;
+    if (!acc[day]) acc[day] = [];
+    acc[day].push(row.ticker);
+    return acc;
+  }, {});
   const selectedWatchlistCount = watchlist === "custom"
     ? customTickerCount
     : watchlist === "holdings"
       ? holdingsTickerCount
-      : selectedWatchlist?.count ?? 0;
+      : watchlist === "earnings"
+        ? (earningsSavedTickerCount || selectedWatchlist?.count || 0)
+        : selectedWatchlist?.count ?? 0;
   const showLongTermCol = scannerMode === "overview" || scannerMode === "longterm";
   const showSwingCol = scannerMode === "overview" || scannerMode === "swing";
   const showFibCol = scannerMode === "overview" || scannerMode === "fib";
@@ -1657,6 +1951,115 @@ export default function ScannerPage() {
                   </div>
                 );
               }
+              if (w.key === "earnings") {
+                return (
+                  <div key={w.key} className={`basis-full rounded-lg border px-3 py-2 ${
+                    watchlist === w.key ? "border-accent/50 bg-surface" : "border-border bg-transparent"
+                  }`}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setWatchlist(w.key);
+                          if (!earningsRows.length) loadEarningsPlaceholders();
+                        }}
+                        className={`rounded px-2 py-1 text-xs font-semibold transition-colors ${
+                          watchlist === w.key ? "text-accent" : "text-muted hover:text-white"
+                        }`}
+                      >
+                        {w.label}
+                      </button>
+                      <span className="text-[11px] text-muted">
+                        {earningsSavedTickerCount || w.count} saved
+                      </span>
+                      <button
+                        type="button"
+                        onClick={scanning ? stopScan : () => startScan("earnings")}
+                        disabled={!scanning && mode === "backtest" && !backtestDate}
+                        className={`rounded px-2 py-1 text-xs font-bold transition-colors ${
+                          scanning
+                            ? "border border-red/30 bg-red/20 text-red hover:bg-red/30"
+                            : mode === "backtest" && !backtestDate
+                              ? "border border-border bg-card text-muted cursor-not-allowed"
+                              : "border border-accent bg-accent text-black hover:bg-accent/85"
+                        }`}
+                      >
+                        {scanning ? "STOP" : "SCAN"}
+                      </button>
+                    </div>
+                    {watchlist === w.key && (
+                      <div className="mt-2 grid gap-2 lg:grid-cols-[160px_92px_minmax(260px,1fr)_auto]">
+                        <input
+                          type="date"
+                          value={earningsStartDate}
+                          onChange={e => setEarningsStartDate(e.target.value)}
+                          className="rounded border border-border bg-card px-2 py-1 text-xs font-mono text-white focus:border-accent focus:outline-none"
+                        />
+                        <input
+                          type="number"
+                          min={1}
+                          max={14}
+                          value={earningsDays}
+                          onChange={e => setEarningsDays(Math.max(1, Math.min(14, Number(e.target.value) || 7)))}
+                          className="rounded border border-border bg-card px-2 py-1 text-xs font-mono text-white focus:border-accent focus:outline-none"
+                          title="Days"
+                        />
+                        <textarea
+                          value={earningsInput}
+                          onChange={e => setEarningsInput(e.target.value)}
+                          placeholder={"AAPL, MSFT, NVDA\n2026-06-03: CRM, ORCL"}
+                          className="min-h-[68px] resize-y rounded border border-border bg-card px-2 py-1 text-xs font-mono text-white placeholder-muted focus:border-accent focus:outline-none"
+                        />
+                        <div className="flex flex-wrap items-start gap-1">
+                          <button
+                            type="button"
+                            onClick={saveEarningsPlaceholders}
+                            disabled={earningsBusy || !earningsInput.trim()}
+                            className="rounded border border-accent/40 px-2 py-1 text-xs font-bold text-accent hover:bg-accent/10 disabled:opacity-40"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={loadEarningsPlaceholders}
+                            disabled={earningsBusy}
+                            className="rounded border border-border px-2 py-1 text-xs font-semibold text-muted hover:text-white disabled:opacity-40"
+                          >
+                            Refresh
+                          </button>
+                          <button
+                            type="button"
+                            onClick={purgeEarningsPlaceholders}
+                            disabled={earningsBusy}
+                            className="rounded border border-yellow/30 px-2 py-1 text-xs font-semibold text-yellow hover:bg-yellow/10 disabled:opacity-40"
+                          >
+                            Purge Done
+                          </button>
+                          <button
+                            type="button"
+                            onClick={dropEarningsPlaceholders}
+                            disabled={earningsBusy}
+                            className="rounded border border-red/30 px-2 py-1 text-xs font-semibold text-red hover:bg-red/10 disabled:opacity-40"
+                          >
+                            Drop Week
+                          </button>
+                        </div>
+                        <div className="lg:col-span-4 flex flex-wrap items-center gap-3 text-[11px] text-muted">
+                          {earningsInputTickerCount > 0 && (
+                            <span>{earningsInputTickerCount} in input</span>
+                          )}
+                          {earningsMsg && <span>{earningsMsg}</span>}
+                          {Object.entries(earningsRowsByDate).slice(0, 7).map(([day, tickers]) => (
+                            <span key={day} className="font-mono">
+                              {day}: {tickers.slice(0, 10).join(", ")}{tickers.length > 10 ? ` +${tickers.length - 10}` : ""}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              }
               if (w.key === "telegram") {
                 return (
                   <div key={w.key} className="flex items-center gap-1">
@@ -1671,7 +2074,7 @@ export default function ScannerPage() {
                     <button
                       onClick={hardPullTelegram}
                       disabled={tgPulling}
-                      title="Force an immediate read of the TOS scan email — don't wait for the 7:15 PM CST job"
+                      title="Force an immediate read of the TOS scan email — don't wait for the Saturday 7:15 PM CST job"
                       className="px-2 py-1.5 text-xs rounded-r-lg font-semibold border border-accent/40 text-accent hover:bg-accent/10 disabled:opacity-40">
                       {tgPulling ? "…" : "↻ Hard pull"}
                     </button>
@@ -1877,7 +2280,102 @@ export default function ScannerPage() {
       </div>
 
       {/* ── Pooled multi-day backtest (8 Fridays) ── */}
-      {mode === "backtest" && (
+      {scannerMode === "snapshots" && (
+        <section className="rounded-lg border border-border bg-surface/35 px-4 py-3">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-white">Saved Snapshots</h2>
+              <p className="mt-1 text-xs text-muted">
+                Persistent scanner snapshots are kept for 7 days, then pruned automatically.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={saveCurrentSnapshot}
+                disabled={snapshotBusy || scanning || results.length === 0}
+                className="rounded-lg border border-accent bg-accent px-3 py-1.5 text-xs font-bold uppercase text-black hover:bg-accent/85 disabled:cursor-not-allowed disabled:border-border disabled:bg-surface disabled:text-muted"
+              >
+                Save Current
+              </button>
+              <button
+                type="button"
+                onClick={refreshSnapshotRows}
+                disabled={snapshotBusy}
+                className="rounded-lg border border-border bg-surface px-3 py-1.5 text-xs font-semibold text-muted hover:border-white/20 hover:text-white disabled:opacity-50"
+              >
+                Refresh
+              </button>
+              <button
+                type="button"
+                onClick={pruneSavedSnapshots}
+                disabled={snapshotBusy}
+                className="rounded-lg border border-yellow/30 bg-yellow/10 px-3 py-1.5 text-xs font-semibold text-yellow hover:bg-yellow/15 disabled:opacity-50"
+              >
+                Delete Old
+              </button>
+            </div>
+          </div>
+
+          {snapshotMsg && (
+            <div className="mb-3 text-xs text-muted">{snapshotMsg}</div>
+          )}
+
+          {snapshotRows.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[640px] text-xs">
+                <thead className="border-b border-border text-muted">
+                  <tr className="text-left">
+                    <th className="py-2 pr-4">Watchlist</th>
+                    <th className="py-2 pr-4">Date</th>
+                    <th className="py-2 pr-4 text-right">Rows</th>
+                    <th className="py-2 pr-4">Saved</th>
+                    <th className="py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {snapshotRows.map(row => (
+                    <tr key={`${row.watchlist}:${row.date}`} className="border-b border-border/60 last:border-b-0">
+                      <td className="py-2 pr-4 font-semibold text-white">
+                        {WATCHLISTS.find(w => w.key === row.watchlist)?.label ?? row.watchlist}
+                      </td>
+                      <td className="py-2 pr-4 font-mono text-accent">{row.date}</td>
+                      <td className="py-2 pr-4 text-right font-mono text-white">{row.count}</td>
+                      <td className="py-2 pr-4 font-mono text-muted">{row.created_at ?? "-"}</td>
+                      <td className="py-2">
+                        <div className="flex justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() => loadSavedSnapshot(row)}
+                            disabled={snapshotBusy}
+                            className="rounded border border-accent/40 px-2 py-1 font-semibold text-accent hover:bg-accent/10 disabled:opacity-50"
+                          >
+                            Load
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteSavedSnapshot(row)}
+                            disabled={snapshotBusy}
+                            className="rounded border border-red/30 px-2 py-1 font-semibold text-red hover:bg-red/10 disabled:opacity-50"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-sm text-muted">
+              No saved snapshots yet.
+            </div>
+          )}
+        </section>
+      )}
+
+      {mode === "backtest" && scannerMode !== "snapshots" && (
         <div className="flex flex-wrap items-center gap-3 px-4 py-2 rounded-lg bg-accent/5 border border-accent/20 text-sm">
           <span className="font-semibold text-accent">⏪⏪ Pooled backtest</span>
           {!pooling ? (
@@ -1903,7 +2401,7 @@ export default function ScannerPage() {
       )}
 
       {/* ── Backtest banner ── */}
-      {activeBacktestDate && results.length > 0 && (() => {
+      {activeBacktestDate && results.length > 0 && scannerMode !== "snapshots" && (() => {
         const { date: effectiveDate, note } = prevTradingDay(activeBacktestDate);
         return (
           <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-accent/10 border border-accent/20 text-sm">
@@ -1916,7 +2414,7 @@ export default function ScannerPage() {
       })()}
 
       {/* ── Backtest: next-day outcome grouped by BTD ── */}
-      {activeBacktestDate && results.length > 0 && (() => {
+      {activeBacktestDate && results.length > 0 && scannerMode !== "snapshots" && (() => {
         const rows = results.filter(r => !r.error && r.btd_state);
         if (rows.length === 0) return null;
         const evaluated = rows.filter(r => r.bt_next_positive != null);
@@ -1991,7 +2489,7 @@ export default function ScannerPage() {
       })()}
 
       {/* ── Backtest: next-day outcome grouped by scanner category ── */}
-      {activeBacktestDate && results.length > 0 && (() => {
+      {activeBacktestDate && results.length > 0 && scannerMode !== "snapshots" && (() => {
         const evaluated = results.filter(r => !r.error && r.verdict && r.bt_next_positive != null);
         if (evaluated.length === 0) return null;
         const stat = (rs: ScanResult[]) => {
@@ -2145,13 +2643,13 @@ export default function ScannerPage() {
       })()}
 
       {/* ── Filter + Sort ── */}
-      {results.length > 0 && (
+      {results.length > 0 && scannerMode !== "snapshots" && (
         <div className="flex flex-wrap gap-4 items-center">
           <div
             className="flex flex-wrap gap-1 bg-card border border-border rounded-lg p-1"
             title="Click a chip to toggle it. Stack multiple chips for an OR-match. Click All (or right-click any chip) to reset."
           >
-            {(["all", "actionable", "rank1", "exceptional", "high_short", "btd", "btd_trigger", "day_spring", "lt_spring", "sweep_reclaim_long", "sweep_reclaim_short", "breakout", "prebreakout", "quality_long", "speculative", "news_good", "news_bad"] as Filter[]).map(f => {
+            {(["all", "actionable", "rank1", "exceptional", "high_short", "btd", "btd_trigger", "day_spring", "lt_spring", "w30ma_curl", "sweep_reclaim_long", "sweep_reclaim_short", "breakout", "prebreakout", "quality_long", "speculative", "news_good", "news_bad"] as Filter[]).map(f => {
               const active = f === "all" ? filters.size === 0 : filters.has(f);
               return (
               <button key={f}
@@ -2172,6 +2670,7 @@ export default function ScannerPage() {
                 : f === "btd_trigger" ? `✅ BTD Trigger · FULL (${results.filter(r => r.btd_state === "TRIGGER").length})`
                 : f === "day_spring" ? `🌱 Day Spring (${results.filter(r => !!r.day_spring).length})`
                 : f === "lt_spring"  ? `🌱 LT Spring (${results.filter(r => !!r.long_term_spring).length})`
+                : f === "w30ma_curl" ? `30wk MA Curl (${results.filter(r => !!r.w30ma_curl).length})`
                 : f === "quality_long" ? `⭐⭐⭐ Bullish 💪 (${results.filter(r => r.lre_score === 3 && (r.verdict === "BULLISH" || r.verdict === "LEAN BULLISH") && r.confidence === "STRONG").length})`
                 : f === "speculative" ? `🚀 Spec/Growth (${results.filter(r => r.multi_bagger || r.long_runway).length})`
                 : f === "news_good"  ? `📰 Good News (${results.filter(r => r.news === "Good").length})`
@@ -2210,7 +2709,7 @@ export default function ScannerPage() {
               [
                 "Ticker","Sector","Price","Verdict","BTD","BTD Zone","Long Term Grade","Long Term Status",
                 "Verdict Flip Date","Verdict Flip From","Days Since Flip",
-                "Long Term Entry Range","Long Term % From Entry","Long Term Risk%","Long Term Spring","Valuation","Valuation Fair Value","Valuation Upside%","Valuation Source","Valuation Reason",
+                "Long Term Entry Range","Long Term % From Entry","Long Term Risk%","Long Term Spring","30wk MA Curl","30wk MA","30wk MA Slope%","30wk MA Reason","Valuation","Valuation Fair Value","Valuation Upside%","Valuation Source","Valuation Reason",
                 "Swing Entry","Swing Stop","Swing T1","Swing T1 Approx Days","Swing Reward%","Swing Risk%","Swing R/R","Swing Invalidation","Swing Spring",
                 "Swing Pre-Breakout","Pre-Breakout Level","Pre-Breakout Distance%","Pre-Breakout Trigger","Pre-Breakout Reason","BTD Trigger",
                 "Fib Target","Fib Reward%","Fib Level","Fib Source","Fib Commentary","Prev Earnings","Last Earnings","Next Earnings (Fib)","Earn Zone","Weekly Zone","Nearest Fib","Fib Compression",
@@ -2228,6 +2727,7 @@ export default function ScannerPage() {
                   r.ticker, r.sector, r.price, r.verdict, r.btd_state, r.btd_zone, r.lre_label, r.lre_status,
                   r.verdict_flip_date, r.verdict_flip_from, r.verdict_flip_days,
                   lreRangeText(r), lreFromEntry, r.lre_risk_pct, r.long_term_spring_text,
+                  r.w30ma_curl ? "Y" : "", r.w30ma, r.w30ma_slope_pct, r.w30ma_reason,
                   r.valuation_label, valuationFairValue(r), valuationUpsidePct(r), r.valuation_source, r.valuation_reason,
                   r.entry, r.stop_loss, r.target1, r.t1_days_text ?? r.t1_days ?? "", rewardPct(r.entry, r.target1), r.risk_pct, r.rr_t1, r.swing_invalidation_text, r.swing_spring_text,
                   r.swing_prebreakout ? "Y" : "", r.swing_prebreakout_level, r.swing_prebreakout_dist_pct, r.swing_prebreakout_trigger, r.swing_prebreakout_reason, r.btd_trigger ? (r.btd_trigger_text || "Y") : "",
@@ -2259,7 +2759,7 @@ export default function ScannerPage() {
       )}
 
       {/* ── Results Table ── */}
-      {filtered.length > 0 && (
+      {filtered.length > 0 && scannerMode !== "snapshots" && (
         <div className="card p-0 overflow-hidden">
           <div className="max-h-[72vh] overflow-auto">
             <table className="min-w-full table-auto text-sm" style={{ borderCollapse: "collapse", width: "max-content" }}>

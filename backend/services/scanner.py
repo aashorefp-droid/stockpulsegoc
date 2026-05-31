@@ -229,8 +229,8 @@ WATCHLISTS: dict[str, list[str]] = _WatchlistsDict({
 })
 
 SWING_UNIVERSE_PRESETS: dict[str, dict] = {
-    "nyse_swing": {"exchange": "NYSE", "min_price": 10.0, "min_volume": 500_000, "limit": 200},
-    "nasdaq_swing": {"exchange": "NASDAQ", "min_price": 10.0, "min_volume": 500_000, "limit": 200},
+    "nyse_swing": {"exchange": "NYSE", "min_price": 10.0, "min_volume": 0, "limit": 200},
+    "nasdaq_swing": {"exchange": "NASDAQ", "min_price": 10.0, "min_volume": 0, "limit": 200},
 }
 _SWING_UNIVERSE_CACHE: dict[str, tuple[float, list[str]]] = {}
 
@@ -287,8 +287,14 @@ def _alpaca_ranked_swing_universe(exchange: str, min_price: float, min_volume: i
             )
         except Exception:
             continue
-        snaps = data.get("snapshots") or {}
+        raw_snaps = data.get("snapshots") if isinstance(data, dict) else {}
+        snaps = raw_snaps if isinstance(raw_snaps, dict) and raw_snaps else data
+        if not isinstance(snaps, dict):
+            snaps = {}
+        batch_set = {s.upper() for s in batch}
         for sym, snap in snaps.items():
+            if str(sym).upper() not in batch_set or not isinstance(snap, dict):
+                continue
             daily = snap.get("dailyBar") or {}
             trade = snap.get("latestTrade") or {}
             price = trade.get("p") or daily.get("c") or 0
@@ -448,8 +454,8 @@ def _etf_fundamentals(ticker: str, price: float) -> dict:
 
 def get_telegram_watchlist() -> list[str]:
     """
-    Tickers from the ThinkOrSwim scan email (TOS → Gmail), refreshed daily by
-    the scheduler ~7:15 PM CST and on-demand via the Hard-pull endpoint.
+    Tickers from the ThinkOrSwim scan email (TOS → Gmail), refreshed every
+    Saturday by the scheduler ~7:15 PM CST and on-demand via Hard pull.
     (Name kept for wiring stability; source is now Gmail, not Telegram.)
     Falls back to the default watchlist if the store is empty.
     """
@@ -461,6 +467,18 @@ def get_telegram_watchlist() -> list[str]:
     except Exception as e:
         print(f"⚠️ TOS/Gmail watchlist fetch failed: {e}")
     return WATCHLISTS["default"]
+
+
+def get_earnings_watchlist() -> list[str]:
+    """Today's earnings scanner tickers, placeholder table first, then discovery."""
+    try:
+        from backend.db.earnings_tracker import today_str
+        from backend.services.earnings import find_earnings_reporters
+
+        return find_earnings_reporters(today_str())
+    except Exception as e:
+        print(f"⚠️ Earnings watchlist fetch failed: {e}")
+    return []
 
 
 def get_short_squeeze_tickers(min_short_pct: float = 10.0, limit: int = 40) -> list[str]:

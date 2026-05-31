@@ -16,6 +16,7 @@ router = APIRouter(prefix="/api/telegram", tags=["telegram"])
 def telegram_test():
     token = _config_value("TELEGRAM_BOT_TOKEN", "DEFAULT_TELEGRAM_BOT_TOKEN")
     chat_id = _config_value("TELEGRAM_CHAT_ID")
+    topic_id = _config_value("TELEGRAM_MESSAGE_THREAD_ID")
     if not token or not chat_id:
         raise HTTPException(status_code=503, detail="Telegram is not configured")
 
@@ -25,15 +26,42 @@ def telegram_test():
         f"Sent from Scanner UI at {now} CT.\n"
         "Default-50 lightning watcher path is reachable."
     )
-    if not send_telegram(token, chat_id, msg):
+    if not send_telegram(token, chat_id, msg, message_thread_id=topic_id):
         raise HTTPException(status_code=502, detail="Telegram send failed")
     return {"ok": True, "message": "Telegram test alert sent"}
+
+
+@router.post("/topic-test")
+def telegram_topic_test(
+    message_thread_id: int | None = None,
+    chat_id: str | None = None,
+):
+    token = _config_value("TELEGRAM_BOT_TOKEN", "DEFAULT_TELEGRAM_BOT_TOKEN")
+    chat_id = chat_id or _config_value("TELEGRAM_GROUP_CHAT_ID", "TELEGRAM_CHAT_ID")
+    topic_id = message_thread_id or _config_value("TELEGRAM_MESSAGE_THREAD_ID")
+    if not token or not chat_id:
+        raise HTTPException(status_code=503, detail="Telegram is not configured")
+
+    msg = (
+        "🧪 <b>Telegram topic delivery test</b>\n"
+        f"chat_id={chat_id}\n"
+        f"message_thread_id={topic_id or 'none'}"
+    )
+    if not send_telegram(token, chat_id, msg, message_thread_id=topic_id):
+        raise HTTPException(status_code=502, detail="Telegram send failed")
+    return {
+        "ok": True,
+        "message": "Telegram topic test alert sent",
+        "chat_id": chat_id,
+        "message_thread_id": topic_id,
+    }
 
 
 @router.post("/lightning-scan")
 def telegram_lightning_scan():
     token = _config_value("TELEGRAM_BOT_TOKEN", "DEFAULT_TELEGRAM_BOT_TOKEN")
     chat_id = _config_value("TELEGRAM_CHAT_ID")
+    topic_id = _config_value("TELEGRAM_MESSAGE_THREAD_ID")
     if not token or not chat_id:
         raise HTTPException(status_code=503, detail="Telegram is not configured")
 
@@ -57,7 +85,7 @@ def telegram_lightning_scan():
     today = datetime.now(ZoneInfo("America/Chicago")).date().isoformat()
     earnings_today = _same_day_earnings_tickers(hits, today)
     msg = _format_lightning_scan_summary(hits, scanned, earnings_today, today)
-    if not send_telegram(token, chat_id, msg):
+    if not send_telegram(token, chat_id, msg, message_thread_id=topic_id):
         raise HTTPException(status_code=502, detail="Telegram send failed")
     return {
         "ok": True,

@@ -160,6 +160,62 @@ def load_snapshot(watchlist: str, day: Optional[str] = None) -> Optional[dict[st
     }
 
 
+def list_snapshots(watchlist: Optional[str] = None) -> list[dict[str, Any]]:
+    """Return saved snapshot metadata, newest first."""
+    _init()
+    key = (watchlist or "").strip().lower()
+
+    if _IS_PG:
+        with _pg_conn() as conn, conn.cursor() as cur:
+            if key:
+                cur.execute(
+                    "SELECT watchlist, day, created_at, count "
+                    "FROM scanner_snapshots WHERE watchlist = %s "
+                    "ORDER BY day DESC, created_at DESC, watchlist ASC",
+                    (key,),
+                )
+            else:
+                cur.execute(
+                    "SELECT watchlist, day, created_at, count "
+                    "FROM scanner_snapshots "
+                    "ORDER BY day DESC, created_at DESC, watchlist ASC"
+                )
+            rows = cur.fetchall()
+            return [
+                {
+                    "watchlist": row[0],
+                    "date": str(row[1]),
+                    "created_at": row[2].isoformat() if hasattr(row[2], "isoformat") else str(row[2]),
+                    "count": int(row[3]),
+                }
+                for row in rows
+            ]
+
+    with _sqlite_conn() as conn:
+        if key:
+            rows = conn.execute(
+                "SELECT watchlist, day, created_at, count "
+                "FROM scanner_snapshots WHERE watchlist = ? "
+                "ORDER BY day DESC, created_at DESC, watchlist ASC",
+                (key,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT watchlist, day, created_at, count "
+                "FROM scanner_snapshots "
+                "ORDER BY day DESC, created_at DESC, watchlist ASC"
+            ).fetchall()
+    return [
+        {
+            "watchlist": row["watchlist"],
+            "date": row["day"],
+            "created_at": row["created_at"],
+            "count": int(row["count"]),
+        }
+        for row in rows
+    ]
+
+
 def delete_snapshot(watchlist: str, day: Optional[str] = None) -> int:
     """Delete one day for a watchlist, or every saved day when day is omitted."""
     _init()

@@ -31,24 +31,61 @@ from backend.services.earnings import (
     get_full_earnings_analysis,
     get_earnings_trade_for_date,
     get_earnings_dates_yf,
-    get_eps_fast,
+    get_eps_fast_batch,
 )
 from backend.services.telegram_svc import send_telegram
 
 logger = logging.getLogger(__name__)
 CST = ZoneInfo("America/Chicago")
 
-# ── Telegram credentials from root config ─────────────────────────────────────
+# ── Telegram credentials from backend config ─────────────────────────────────
 try:
-    _ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
-    sys.path.insert(0, os.path.abspath(_ROOT))
-    from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  # type: ignore
+    from backend.config import (
+        TELEGRAM_BOT_TOKEN,
+        TELEGRAM_CHAT_ID,
+        TELEGRAM_GROUP_CHAT_ID,
+        TELEGRAM_MESSAGE_THREAD_ID,
+        TELEGRAM_SWING_MESSAGE_THREAD_ID,
+        TELEGRAM_SPY_INTRADAY_MESSAGE_THREAD_ID,
+        TELEGRAM_EARNINGS_MESSAGE_THREAD_ID,
+        TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID,
+        TELEGRAM_MACRO_MESSAGE_THREAD_ID,
+    )  # type: ignore
 except ImportError:
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+    try:
+        _ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+        sys.path.insert(0, os.path.abspath(_ROOT))
+        from config import (
+            TELEGRAM_BOT_TOKEN,
+            TELEGRAM_CHAT_ID,
+            TELEGRAM_GROUP_CHAT_ID,
+            TELEGRAM_MESSAGE_THREAD_ID,
+            TELEGRAM_SWING_MESSAGE_THREAD_ID,
+            TELEGRAM_SPY_INTRADAY_MESSAGE_THREAD_ID,
+            TELEGRAM_EARNINGS_MESSAGE_THREAD_ID,
+            TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID,
+            TELEGRAM_MACRO_MESSAGE_THREAD_ID,
+        )  # type: ignore
+    except ImportError:
+        TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+        TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "")
+        TELEGRAM_MESSAGE_THREAD_ID = os.getenv("TELEGRAM_MESSAGE_THREAD_ID", "")
+        TELEGRAM_SWING_MESSAGE_THREAD_ID = os.getenv("TELEGRAM_SWING_MESSAGE_THREAD_ID", "")
+        TELEGRAM_SPY_INTRADAY_MESSAGE_THREAD_ID = os.getenv("TELEGRAM_SPY_INTRADAY_MESSAGE_THREAD_ID", "")
+        TELEGRAM_EARNINGS_MESSAGE_THREAD_ID = os.getenv("TELEGRAM_EARNINGS_MESSAGE_THREAD_ID", "")
+        TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID = os.getenv("TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID", "")
+        TELEGRAM_MACRO_MESSAGE_THREAD_ID = os.getenv("TELEGRAM_MACRO_MESSAGE_THREAD_ID", "")
 
 # ── Scheduler instance ────────────────────────────────────────────────────────
 scheduler = AsyncIOScheduler(timezone="America/Chicago")
+
+
+def _telegram_target(thread_id: str | None = None) -> tuple[str, str | None]:
+    target_chat = TELEGRAM_GROUP_CHAT_ID or TELEGRAM_CHAT_ID
+    if thread_id and str(thread_id).strip():
+        return target_chat, str(thread_id).strip()
+    return target_chat, str(TELEGRAM_MESSAGE_THREAD_ID).strip() or None
 
 
 def _env_enabled(name: str, default: str = "0") -> bool:
@@ -60,6 +97,18 @@ _SCANNER_SNAPSHOT_ENABLED = _env_enabled(
     os.getenv("MOMENTUM_SNAPSHOT_ENABLED", "1"),
 )
 _SWEEP_DIGEST_ENABLED = _env_enabled("SWEEP_DIGEST_ENABLED", "1")
+_SPY_V4_SUMMARY_ENABLED = _env_enabled("SPY_V4_SUMMARY_ENABLED", "1")
+_EXCEPTIONAL_SWING_DIGEST_ENABLED = _env_enabled("EXCEPTIONAL_SWING_DIGEST_ENABLED", "1")
+_EXCEPTIONAL_SWING_DIGEST_WATCHLISTS = [
+    w.strip().lower()
+    for w in os.getenv("EXCEPTIONAL_SWING_DIGEST_WATCHLISTS", "nyse_swing,nasdaq_swing").split(",")
+    if w.strip()
+]
+try:
+    _EXCEPTIONAL_SWING_MAX_WORKERS = max(1, int(os.getenv("EXCEPTIONAL_SWING_MAX_WORKERS", "8")))
+except ValueError:
+    _EXCEPTIONAL_SWING_MAX_WORKERS = 8
+_EXCEPTIONAL_SWING_SEND_EMPTY = _env_enabled("EXCEPTIONAL_SWING_SEND_EMPTY", "1")
 _HOLDINGS_SUMMARY_ENABLED = _env_enabled("HOLDINGS_SUMMARY_ENABLED", "1")
 _HOLDINGS_EMAIL_ENABLED = _env_enabled("HOLDINGS_EMAIL_ENABLED", "1")
 _HOLDINGS_TELEGRAM_ENABLED = _env_enabled("HOLDINGS_TELEGRAM_ENABLED", "1")
@@ -71,6 +120,7 @@ except ValueError:
 # Earnings jobs — pre-earnings discovery (8:30 CST) + EPS polling
 # (15:00–18:00 CST). Default OFF; set EARNINGS_JOBS_ENABLED=1 to re-enable.
 _EARNINGS_JOBS_ENABLED = _env_enabled("EARNINGS_JOBS_ENABLED", "0")
+_EPS_POLL_EMPTY_STREAK = 0
 # Regime-change Telegram alerts (verdict + γ flips). Default ON; set
 # MACRO_ALERTS_ENABLED=0 to silence.
 _MACRO_ALERTS_ENABLED  = _env_enabled("MACRO_ALERTS_ENABLED", "1")
@@ -117,8 +167,8 @@ def _mark_daily_job_sent(key: str, day: str | None = None) -> None:
 def _fmt_pre(ticker: str, analysis: dict) -> str:
     d     = analysis.get("direction", {})
     stats = analysis.get("stats", {})
-    em    = analysis.get("expected_move", {})
-    rev   = analysis.get("revisions", {})
+    em    = analysis.get("expected_move", {}) or {}
+    rev   = analysis.get("revisions", {}) or {}
     sq    = d.get("squeeze_setup")
 
     lines = [f"<b>📊 PRE-EARNINGS: {ticker}</b>"]
@@ -140,7 +190,7 @@ def _fmt_pre(ticker: str, analysis: dict) -> str:
     score   = d.get("score", 0)
     lines.append(f"Direction: <b>{dir_str}</b> ({conf}, score {score:+d})")
 
-    if em and not em.get("error"):
+    if em and not em.get("error") and not em.get("skipped"):
         lines.append(
             f"Options move: ±{em.get('expected_move_pct', '—')}%"
             f"  |  IV skew: {em.get('iv_skew', '—')}%"
@@ -234,8 +284,13 @@ async def pre_earnings_job():
         logger.warning(f"[scheduler] watchlist merge failed: {e}")
 
     if not tickers:
-        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-                      f"📭 <b>No earnings reporters</b> found in watchlist for {today}")
+        chat_id, thread_id = _telegram_target(TELEGRAM_EARNINGS_MESSAGE_THREAD_ID)
+        send_telegram(
+            TELEGRAM_BOT_TOKEN,
+            chat_id,
+            f"📭 <b>No earnings reporters</b> found in watchlist for {today}",
+            message_thread_id=thread_id,
+        )
         logger.info("[scheduler] No reporters found")
         return
 
@@ -244,9 +299,14 @@ async def pre_earnings_job():
         upsert_ticker(t, today)
 
     # Summary header
-    send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-                  f"📅 <b>Earnings Today — {today}</b>\n"
-                  f"Found: {', '.join(tickers)}\nSending pre-earnings analysis…")
+    chat_id, thread_id = _telegram_target(TELEGRAM_EARNINGS_MESSAGE_THREAD_ID)
+    send_telegram(
+        TELEGRAM_BOT_TOKEN,
+        chat_id,
+        f"📅 <b>Earnings Today — {today}</b>\n"
+        f"Found: {', '.join(tickers)}\nSending pre-earnings analysis…",
+        message_thread_id=thread_id,
+    )
 
     # Per-ticker pre-earnings alert
     for ticker in tickers:
@@ -257,12 +317,17 @@ async def pre_earnings_job():
                 continue
 
             # Save eps_estimate to DB so poll can use it later
-            eps_est = analysis.get("revisions", {}).get("est_current")
+            eps_est = (analysis.get("revisions") or {}).get("est_current")
             if eps_est is not None:
                 upsert_ticker(ticker, today, eps_estimate=eps_est)
 
             msg = _fmt_pre(ticker, analysis)
-            ok  = send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+            ok  = send_telegram(
+                TELEGRAM_BOT_TOKEN,
+                chat_id,
+                msg,
+                message_thread_id=thread_id,
+            )
 
             pre_drift = None
             dir_info  = analysis.get("direction", {})
@@ -284,34 +349,90 @@ async def pre_earnings_job():
 
 # ── Job: 3 PM–6 PM CST — per-minute EPS poll ─────────────────────────────────
 
+def _reschedule_eps_poll(seconds: int, reason: str) -> None:
+    """Adjust EPS polling cadence without recreating the job."""
+    seconds = max(60, min(seconds, 600))
+    job = scheduler.get_job("eps_poll")
+    if not job:
+        return
+    try:
+        job.reschedule(trigger="interval", seconds=seconds)
+        logger.info("[scheduler] EPS polling cadence: %ss (%s)", seconds, reason)
+    except Exception as exc:
+        logger.debug("[scheduler] EPS polling reschedule skipped: %s", exc)
+
+
+def _daily_price_moves_batch(tickers: list[str]) -> dict[str, dict]:
+    try:
+        import yfinance as yf
+        data = yf.download(
+            tickers=" ".join(tickers),
+            period="3d",
+            interval="1d",
+            group_by="ticker",
+            progress=False,
+            threads=True,
+            auto_adjust=False,
+        )
+        if data is None or data.empty:
+            return {}
+
+        out: dict[str, dict] = {}
+        multi = getattr(data.columns, "nlevels", 1) > 1
+        for ticker in tickers:
+            try:
+                df = data[ticker] if multi and ticker in data.columns.get_level_values(0) else data
+                df = df.dropna(how="all")
+                if len(df) < 2:
+                    continue
+                prev_close = float(df["Close"].iloc[-2])
+                today_open = float(df["Open"].iloc[-1])
+                today_close = float(df["Close"].iloc[-1])
+                out[ticker] = {
+                    "gap_pct": round((today_open - prev_close) / prev_close * 100, 2),
+                    "day_pct": round((today_close - prev_close) / prev_close * 100, 2),
+                    "current_price": today_close,
+                }
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+
 async def poll_for_eps():
     """
     1-min poll: check fast EPS sources, send post-earnings Telegram once confirmed.
     Sends as soon as EPS actual is available — doesn't wait for next-day price data.
     For AMC reporters the gap/day will be 0; for BMO they'll be populated once market closed.
     """
-    import yfinance as yf
     from zoneinfo import ZoneInfo
+    global _EPS_POLL_EMPTY_STREAK
 
     today   = today_str()
     pending = get_pending_post(today)
 
     if not pending:
         logger.debug("[scheduler] poll: no pending tickers")
+        _reschedule_eps_poll(300, "no pending tickers")
         return
 
-    logger.info(f"[scheduler] polling EPS for: {[r['ticker'] for r in pending]}")
+    pending_tickers = [str(r["ticker"]).upper() for r in pending]
+    logger.info(f"[scheduler] polling EPS for: {pending_tickers}")
 
     # Determine if market is closed (after 4 PM ET) — only then do we have closing prices
     now_et        = datetime.now(ZoneInfo("America/New_York"))
     market_closed = now_et.hour >= 16
+    eps_by_ticker = get_eps_fast_batch(pending_tickers, today)
+    price_by_ticker = _daily_price_moves_batch(pending_tickers) if market_closed else {}
+    sent_count = 0
 
     for row in pending:
         ticker       = row["ticker"]
         eps_est_db   = row.get("eps_estimate")   # saved at 8:30 AM
         try:
             # ── Step 1: fast EPS sources (Yahoo quoteSummary → Benzinga → Finviz) ──
-            eps = get_eps_fast(ticker, today) or {}
+            eps = eps_by_ticker.get(str(ticker).upper()) or {}
 
             # ── Step 2: fall back to yfinance earnings_dates if fast failed ─────────
             if not eps or eps.get("eps_actual") is None:
@@ -346,26 +467,10 @@ async def poll_for_eps():
                     )
 
             # ── Step 3: get price movement (only if market closed) ────────────────
-            gap_pct = day_pct = current_price = None
-            if market_closed:
-                try:
-                    hist = yf.Ticker(ticker).history(period="3d", interval="1d")
-                    if len(hist) >= 2:
-                        prev_close    = float(hist["Close"].iloc[-2])
-                        today_open    = float(hist["Open"].iloc[-1])
-                        today_close   = float(hist["Close"].iloc[-1])
-                        gap_pct       = round((today_open  - prev_close) / prev_close * 100, 2)
-                        day_pct       = round((today_close - prev_close) / prev_close * 100, 2)
-                        current_price = today_close
-                except Exception:
-                    pass
-            else:
-                # Pre-close: fetch after-hours last price if available
-                try:
-                    fi = yf.Ticker(ticker).fast_info
-                    current_price = float(getattr(fi, "last_price", None) or 0) or None
-                except Exception:
-                    pass
+            px = price_by_ticker.get(str(ticker).upper(), {})
+            gap_pct = px.get("gap_pct")
+            day_pct = px.get("day_pct")
+            current_price = px.get("current_price")
 
             trade = {
                 "ticker":        ticker,
@@ -382,7 +487,13 @@ async def poll_for_eps():
             }
 
             msg = _fmt_post(ticker, trade, eps)
-            ok  = send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+            chat_id, thread_id = _telegram_target(TELEGRAM_EARNINGS_MESSAGE_THREAD_ID)
+            ok  = send_telegram(
+                TELEGRAM_BOT_TOKEN,
+                chat_id,
+                msg,
+                message_thread_id=thread_id,
+            )
 
             if ok:
                 mark_post_notified(
@@ -401,23 +512,43 @@ async def poll_for_eps():
                     f"[scheduler] post-earnings sent for {ticker}: "
                     f"EPS={eps.get('eps_actual')}, surprise={eps.get('surprise_pct')}%"
                 )
+                sent_count += 1
 
         except Exception as e:
             logger.error(f"[scheduler] poll error for {ticker}: {e}")
 
+    if sent_count:
+        _EPS_POLL_EMPTY_STREAK = 0
+        _reschedule_eps_poll(60, f"{sent_count} EPS update(s) found")
+    else:
+        _EPS_POLL_EMPTY_STREAK += 1
+        if now_et.hour < 16:
+            _reschedule_eps_poll(180, "pre-close waiting")
+        elif _EPS_POLL_EMPTY_STREAK >= 5:
+            _reschedule_eps_poll(300, "no EPS after repeated polls")
+        else:
+            _reschedule_eps_poll(120, "no EPS yet")
+
 
 def start_eps_polling():
     """3:00 PM CST — add the 1-minute polling interval job."""
+    global _EPS_POLL_EMPTY_STREAK
+    _EPS_POLL_EMPTY_STREAK = 0
     if not scheduler.get_job("eps_poll"):
         scheduler.add_job(
             poll_for_eps,
             "interval",
-            minutes=1,
+            seconds=60,
             id="eps_poll",
             max_instances=1,
         )
-        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-                      f"⏱ EPS polling started (every 1 min) for {today_str()}")
+        chat_id, thread_id = _telegram_target(TELEGRAM_EARNINGS_MESSAGE_THREAD_ID)
+        send_telegram(
+            TELEGRAM_BOT_TOKEN,
+            chat_id,
+            f"⏱ EPS polling started (every 1 min) for {today_str()}",
+            message_thread_id=thread_id,
+        )
         logger.info("[scheduler] EPS polling started")
 
 
@@ -447,9 +578,14 @@ def momentum_scan_job():
             except Exception:
                 pass
 
+    chat_id, thread_id = _telegram_target(TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID)
     if not results:
-        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-                      f"📊 <b>Momentum Scan {today_str()}</b>\nNo strong signals found today.")
+        send_telegram(
+            TELEGRAM_BOT_TOKEN,
+            chat_id,
+            f"📊 <b>Momentum Scan {today_str()}</b>\nNo strong signals found today.",
+            message_thread_id=thread_id,
+        )
         return
 
     # Sort: score descending (strongest signals first)
@@ -488,7 +624,12 @@ def momentum_scan_job():
             line += f"\n   {opt_sum}"
         lines.append(line)
 
-    send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, "\n".join(lines))
+    send_telegram(
+        TELEGRAM_BOT_TOKEN,
+        chat_id,
+        "\n".join(lines),
+        message_thread_id=thread_id,
+    )
     logger.info(f"[scheduler] momentum scan sent: {len(results)} signals")
 
 
@@ -506,7 +647,7 @@ def scanner_snapshot_job():
 
         watchlists = configured_watchlists()
         snaps = refresh_snapshots(watchlists)
-        pruned = prune_snapshots(watchlists=watchlists)
+        pruned = prune_snapshots()
         summary = ", ".join(
             f"{s.get('watchlist')}={s.get('count', 0)}"
             for s in snaps.get("watchlists", [])
@@ -525,6 +666,99 @@ def scanner_snapshot_job():
 def momentum_snapshot_job():
     """Backward-compatible entrypoint for the old Momentum-only scheduler."""
     scanner_snapshot_job()
+
+
+def spy_v4_summary_job():
+    """8:00 AM CST: send SPY Day Trading V4 plan to Telegram."""
+    if not _SPY_V4_SUMMARY_ENABLED:
+        logger.info("[scheduler] SPY V4 summary skipped: SPY_V4_SUMMARY_ENABLED=0")
+        return
+
+    import html
+
+    try:
+        from backend.services.scanner import scan_single
+
+        row = scan_single("SPY", None, None, "daytrading")
+        chat_id, thread_id = _telegram_target(TELEGRAM_SPY_INTRADAY_MESSAGE_THREAD_ID)
+        if row.get("error"):
+            msg = (
+                f"<b>SPY Day Trading V4 - {today_str()}</b>\n"
+                f"Unavailable: {html.escape(str(row.get('error') or 'unknown error'))}"
+            )
+            send_telegram(
+                TELEGRAM_BOT_TOKEN,
+                chat_id,
+                msg,
+                message_thread_id=thread_id,
+            )
+            logger.warning("[scheduler] SPY V4 summary unavailable: %s", row.get("error"))
+            return
+
+        def _money(value) -> str:
+            return f"${float(value):.2f}" if isinstance(value, (int, float)) else "-"
+
+        def _rr(value) -> str:
+            return f"{float(value):.2f}x" if isinstance(value, (int, float)) else "-"
+
+        setup = str(row.get("dt4_setup") or "-")
+        setup_text = html.escape(setup.replace("_", " "))
+        side = str(row.get("dt4_side") or "-")
+        side_label = "Long" if side == "long" else "Short" if side == "short" else "Plan"
+        grade = html.escape(str(row.get("dt4_grade") or "-"))
+        bias = html.escape(str(row.get("dt4_bias") or "-"))
+        context = html.escape(str(row.get("dt4_context") or "-"))
+        range_wait = setup == "range_wait"
+
+        if range_wait:
+            level_lines = [
+                f"Support: PDL {_money(row.get('dt4_pdl'))} / PWL {_money(row.get('dt4_pwl'))}",
+                f"Resistance: PDH {_money(row.get('dt4_pdh'))} / PWH {_money(row.get('dt4_pwh'))}",
+                "Entry: wait for reclaim/reject confirmation",
+                "Risk: define after trigger",
+                "Target: VWAP/mid, then opposite edge",
+            ]
+        else:
+            level = html.escape(str(row.get("dt4_level") or "-"))
+            level_lines = [
+                f"Level: {level} {_money(row.get('dt4_level_val'))}",
+                f"Watch/Entry: {_money(row.get('dt4_entry'))}",
+                f"Stop: {_money(row.get('dt4_stop'))}",
+                f"T1: {_money(row.get('dt4_t1'))} / T2: {_money(row.get('dt4_t2'))}",
+                f"R:R: {_rr(row.get('dt4_rr'))}",
+            ]
+
+        trigger = html.escape(str(row.get("dt4_trigger") or "-"))[:320]
+        invalidation = html.escape(str(row.get("dt4_invalidation") or "-"))[:260]
+        target_plan = html.escape(str(row.get("dt4_target_plan") or "-"))[:260]
+        exit_plan = html.escape(str(row.get("dt4_exit_plan") or "-"))[:260]
+        note = html.escape(str(row.get("dt4_note") or ""))[:260]
+
+        msg = (
+            f"<b>SPY Day Trading V4 - {today_str()}</b>\n"
+            f"{side_label} | {setup_text} | Grade {grade}\n"
+            f"Bias: {bias} | Context: {context}\n"
+            f"Price: {_money(row.get('price'))} | ATR: {_money(row.get('dt4_atr'))}\n"
+            f"PDH {_money(row.get('dt4_pdh'))} | PDL {_money(row.get('dt4_pdl'))} | "
+            f"PWH {_money(row.get('dt4_pwh'))} | PWL {_money(row.get('dt4_pwl'))}\n\n"
+            + "\n".join(level_lines)
+            + f"\n\nTrigger: {trigger}\n"
+            f"Invalidation: {invalidation}\n"
+            f"Target plan: {target_plan}\n"
+            f"Exit plan: {exit_plan}"
+        )
+        if note:
+            msg += f"\nNote: {note}"
+
+        sent = send_telegram(
+            TELEGRAM_BOT_TOKEN,
+            chat_id,
+            msg,
+            message_thread_id=thread_id,
+        )
+        logger.info("[scheduler] SPY V4 summary sent=%s setup=%s side=%s", sent, setup, side)
+    except Exception as e:
+        logger.error(f"[scheduler] SPY V4 summary failed: {e}")
 
 
 def sweep_digest_job():
@@ -631,6 +865,170 @@ def sweep_digest_job():
         )
     except Exception as e:
         logger.error(f"[scheduler] sweep digest failed: {e}")
+
+
+def exceptional_swing_digest_job():
+    """Post-market: scan NYSE/NASDAQ swing universes and send Exceptional setups only."""
+    if not _EXCEPTIONAL_SWING_DIGEST_ENABLED:
+        logger.info("[scheduler] exceptional swing digest skipped: EXCEPTIONAL_SWING_DIGEST_ENABLED=0")
+        return
+
+    import html
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        from backend.services.scanner import (
+            SWING_UNIVERSE_PRESETS,
+            get_swing_universe_tickers,
+            scan_single,
+        )
+        from backend.services.scanner_snapshot import save_snapshot
+
+        watchlists = [
+            w for w in _EXCEPTIONAL_SWING_DIGEST_WATCHLISTS
+            if w in SWING_UNIVERSE_PRESETS
+        ] or ["nyse_swing", "nasdaq_swing"]
+
+        def is_exceptional(row: dict) -> bool:
+            return (
+                not row.get("error")
+                and row.get("mtf_rank") == 1
+                and row.get("entry_grade") in ("S", "A")
+                and row.get("vol_trend") == "ACCUMULATING"
+            )
+
+        all_hits: list[dict] = []
+        scanned_total = 0
+        snapshot_counts: dict[str, int] = {}
+
+        for watchlist in watchlists:
+            tickers = get_swing_universe_tickers(watchlist)
+            if not tickers:
+                logger.warning("[scheduler] exceptional swing: %s produced no tickers", watchlist)
+                snapshot_counts[watchlist] = 0
+                continue
+
+            workers = max(1, min(len(tickers), _EXCEPTIONAL_SWING_MAX_WORKERS))
+            results: list[dict | None] = [None] * len(tickers)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(scan_single, ticker, None, None, "swing"): idx
+                    for idx, ticker in enumerate(tickers)
+                }
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    try:
+                        row = fut.result()
+                    except Exception as exc:
+                        row = {
+                            "ticker": tickers[idx],
+                            "error": str(exc)[:120],
+                            "score": 0,
+                        }
+                    if isinstance(row, dict):
+                        row["snapshot_watchlist"] = watchlist
+                        results[idx] = row
+
+            clean_results = [r for r in results if isinstance(r, dict)]
+            scanned_total += len(clean_results)
+            snapshot_counts[watchlist] = len(clean_results)
+            save_snapshot(watchlist, clean_results)
+            all_hits.extend(r for r in clean_results if is_exceptional(r))
+
+        def _money(value) -> str:
+            return f"${float(value):.2f}" if isinstance(value, (int, float)) else "-"
+
+        def _pct(value) -> str:
+            return f"{float(value):.1f}%" if isinstance(value, (int, float)) else "-"
+
+        def _reward_pct(row: dict) -> str:
+            entry = row.get("entry")
+            target = row.get("target1")
+            try:
+                if isinstance(entry, (int, float)) and isinstance(target, (int, float)) and entry:
+                    return f"{abs(float(target) - float(entry)) / abs(float(entry)) * 100:.1f}%"
+            except Exception:
+                pass
+            return "-"
+
+        def _rr(value) -> str:
+            return f"{float(value):.2f}x" if isinstance(value, (int, float)) else "-"
+
+        grade_rank = {"S": 0, "A": 1}
+        all_hits.sort(
+            key=lambda r: (
+                grade_rank.get(str(r.get("entry_grade") or ""), 9),
+                -abs(float(r.get("score") or 0)),
+                str(r.get("ticker") or ""),
+            )
+        )
+
+        today = datetime.now(CST).date().isoformat()
+        counts = ", ".join(f"{k}={v}" for k, v in snapshot_counts.items())
+        if not all_hits:
+            if not _EXCEPTIONAL_SWING_SEND_EMPTY:
+                logger.info("[scheduler] exceptional swing digest: 0 hits; scanned %s (%s)", scanned_total, counts)
+                return
+            msg = (
+                f"<b>Exceptional Swing Setups - {today}</b>\n"
+                f"NYSE/NASDAQ daily swing scan: 0 Exceptional / {scanned_total} scanned\n"
+                f"Snapshots saved: {html.escape(counts or '-')}"
+            )
+            target_chat = TELEGRAM_GROUP_CHAT_ID or TELEGRAM_CHAT_ID
+            send_thread = TELEGRAM_SWING_MESSAGE_THREAD_ID or TELEGRAM_MESSAGE_THREAD_ID
+            sent = send_telegram(
+                TELEGRAM_BOT_TOKEN,
+                target_chat,
+                msg,
+                message_thread_id=send_thread,
+            )
+            logger.info("[scheduler] exceptional swing digest sent empty=%s scanned=%s", sent, scanned_total)
+            return
+
+        def _line(row: dict) -> str:
+            ticker = html.escape(str(row.get("ticker") or "").upper())
+            source = html.escape(str(row.get("snapshot_watchlist") or "").replace("_", " ").upper())
+            verdict = html.escape(str(row.get("verdict") or "-"))
+            grade = html.escape(str(row.get("entry_grade") or "-"))
+            btd = html.escape(str(row.get("btd_state") or "-"))
+            parts = [
+                f"<b>{ticker}</b> {source}",
+                f"{_money(row.get('price'))} | {verdict} | Grade {grade}",
+                f"Entry {_money(row.get('entry'))} / Stop {_money(row.get('stop_loss'))} / T1 {_money(row.get('target1'))}",
+                f"R/R {_rr(row.get('rr_t1'))} | Reward {_reward_pct(row)} | BTD {btd}",
+            ]
+            reason = str(row.get("lre_reason") or row.get("mtf_action") or "")[:180]
+            if reason:
+                parts.append(html.escape(reason))
+            return "\n   ".join(parts)
+
+        max_rows = 12
+        header = (
+            f"<b>Exceptional Swing Setups - {today}</b>\n"
+            f"{len(all_hits)} Exceptional / {scanned_total} scanned\n"
+            f"Snapshots saved: {html.escape(counts or '-')}\n"
+        )
+        body = "\n\n".join(_line(row) for row in all_hits[:max_rows])
+        if len(all_hits) > max_rows:
+            body += f"\n\n+{len(all_hits) - max_rows} more Exceptional setups saved in snapshots."
+        msg = f"{header}\n{body}"
+        target_chat = TELEGRAM_GROUP_CHAT_ID or TELEGRAM_CHAT_ID
+        send_thread = TELEGRAM_SWING_MESSAGE_THREAD_ID or TELEGRAM_MESSAGE_THREAD_ID
+        sent = send_telegram(
+            TELEGRAM_BOT_TOKEN,
+            target_chat,
+            msg,
+            message_thread_id=send_thread,
+        )
+        logger.info(
+            "[scheduler] exceptional swing digest sent=%s hits=%s scanned=%s (%s)",
+            sent,
+            len(all_hits),
+            scanned_total,
+            counts,
+        )
+    except Exception as e:
+        logger.error(f"[scheduler] exceptional swing digest failed: {e}")
 
 
 def holdings_summary_job():
@@ -1064,7 +1462,13 @@ def news_summary_job(title: str = "News Digest", state_key: str = "news_summary"
     )
     if title != "News Digest":
         msg = msg.replace("<b>News Digest", f"<b>{html.escape(title)}", 1)
-    sent_ok = send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+    group_chat_id = TELEGRAM_GROUP_CHAT_ID or TELEGRAM_CHAT_ID
+    sent_ok = send_telegram(
+        TELEGRAM_BOT_TOKEN,
+        group_chat_id,
+        msg,
+        message_thread_id=TELEGRAM_MESSAGE_THREAD_ID,
+    )
     if sent_ok:
         _mark_daily_job_sent(state_key)
     else:
@@ -1121,7 +1525,7 @@ def schedule_news_summary_startup_catchup():
 
 
 def telegram_watchlist_job():
-    """7:15 PM CST — pull the day's tickers from the TOS scan email (Gmail)."""
+    """Saturday 7:15 PM CST — pull weekly tickers from the TOS scan email (Gmail)."""
     try:
         from backend.services.gmail_watchlist import (
             poll_and_store, fetch_today_watchlist,
@@ -1369,7 +1773,13 @@ def macro_regime_watch_job():
     msg = "\n".join(lines)
 
     try:
-        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+        chat_id, thread_id = _telegram_target(TELEGRAM_MACRO_MESSAGE_THREAD_ID)
+        send_telegram(
+            TELEGRAM_BOT_TOKEN,
+            chat_id,
+            msg,
+            message_thread_id=thread_id,
+        )
         logger.info(
             f"[macro_watch] alerted: {prev_verdict} → {verdict} "
             f"(γ {prev_gamma} → {gex_regime})"
@@ -1405,9 +1815,12 @@ def momentum_refresh_job():
         if not new_set:
             err = result.get("error", "no candidates passed filters")
             logger.warning(f"[scheduler] momentum_refresh empty — {err}; keeping previous list")
+            chat_id, thread_id = _telegram_target(TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID)
             send_telegram(
-                TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+                TELEGRAM_BOT_TOKEN,
+                chat_id,
                 f"⚠️ Momentum refresh returned empty ({html.escape(str(err))}) — keeping previous list.",
+                message_thread_id=thread_id,
             )
             return
 
@@ -1432,7 +1845,13 @@ def momentum_refresh_job():
                 f"\n<b>Dropped:</b> {', '.join(html.escape(t) for t in dropped) or '—'}"
             )
         msg += f"\n\n<b>Full list:</b> {', '.join(html.escape(t) for t in new_list)}"
-        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+        chat_id, thread_id = _telegram_target(TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID)
+        send_telegram(
+            TELEGRAM_BOT_TOKEN,
+            chat_id,
+            msg,
+            message_thread_id=thread_id,
+        )
         logger.info(
             f"[scheduler] momentum_refresh: wrote {len(new_set)} tickers "
             f"(+{len(added)} -{len(dropped)})"
@@ -1440,11 +1859,15 @@ def momentum_refresh_job():
     except Exception as e:
         logger.error(f"[scheduler] momentum_refresh failed: {e}")
         try:
-            send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-                          f"❌ Momentum refresh failed: {type(e).__name__}: {str(e)[:200]}")
+            chat_id, thread_id = _telegram_target(TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID)
+            send_telegram(
+                TELEGRAM_BOT_TOKEN,
+                chat_id,
+                f"❌ Momentum refresh failed: {type(e).__name__}: {str(e)[:200]}",
+                message_thread_id=thread_id,
+            )
         except Exception:
             pass
-
 
 # ── Scheduler setup ───────────────────────────────────────────────────────────
 
@@ -1464,6 +1887,14 @@ def setup_scheduler():
             replace_existing=True,
             misfire_grace_time=300,
         )
+
+    scheduler.add_job(
+        spy_v4_summary_job,
+        CronTrigger(day_of_week="mon-fri", hour=8, minute=0, timezone=CST),
+        id="spy_v4_summary_morning",
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
 
     scheduler.add_job(
         news_summary_job,
@@ -1501,6 +1932,14 @@ def setup_scheduler():
         sweep_digest_job,
         CronTrigger(day_of_week="mon-fri", hour=15, minute=40, timezone=CST),
         id="sweep_digest_close",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        exceptional_swing_digest_job,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=CST),
+        id="exceptional_swing_digest_close",
         replace_existing=True,
         misfire_grace_time=3600,
     )
@@ -1553,7 +1992,7 @@ def setup_scheduler():
 
     scheduler.add_job(
         telegram_watchlist_job,
-        CronTrigger(hour=19, minute=15, timezone=CST),  # 7:15 PM CST
+        CronTrigger(day_of_week="sat", hour=19, minute=15, timezone=CST),  # Saturday 7:15 PM CST
         id="telegram_watchlist",
         replace_existing=True,
         misfire_grace_time=3600,
@@ -1594,17 +2033,11 @@ def setup_scheduler():
         misfire_grace_time=3600,
     )
 
-    # Prime the store at startup so the watchlist isn't empty before the
-    # first 7:15 PM CST pull.
-    try:
-        telegram_watchlist_job()
-    except Exception as e:
-        logger.warning(f"[scheduler] startup TOS/Gmail prime failed: {e}")
-
     _macro_w = "macro_regime_watch every 5m Mon-Fri 8-15:55CST" if _MACRO_ALERTS_ENABLED else "macro_regime_watch DISABLED"
     logger.info(
         f"[scheduler] registered: scanner_snapshots@15:25CST, sweep_digest@15:40CST, "
-        f"holdings_summary@15:50CST daily, momentum_refresh@Sun18:00CST, {_macro_w}"
+        f"holdings_summary@15:50CST daily, exceptional_swing@16:05CST Mon-Fri, "
+        f"momentum_refresh@Sun18:00CST, {_macro_w}"
     )
     _earn = (
         "pre_earnings@8:30CST, polling 15:00–18:00 CST"
@@ -1613,6 +2046,6 @@ def setup_scheduler():
     )
     logger.info(
         f"[scheduler] registered: news_summary@8:00CST, news_summary_post_market@15:35CST, {_earn}, "
-        "momentum@8:45CST, tos_gmail_watchlist@19:15CST, "
+        "spy_v4_summary@8:00CST Mon-Fri, momentum@8:45CST, tos_gmail_watchlist@Sat19:15CST, "
         "spy_gamma + sector_gamma after open and after close Mon–Fri"
     )
