@@ -90,10 +90,18 @@ def trigger_sweep_digest():
 
 @router.post("/run-breakouts")
 def trigger_breakout_digest():
-    """Manually trigger the post-market breakout scanner digest."""
+    """Manually trigger the post-market exceptional/V3 scanner digest."""
     from backend.services.scheduler import breakout_digest_job
     breakout_digest_job()
-    return {"status": "breakout digest completed"}
+    return {"status": "exceptional/V3 digest completed"}
+
+
+@router.post("/run-exceptional")
+def trigger_exceptional_swing_digest():
+    """Manually trigger the post-market exceptional/V3 scanner digest."""
+    from backend.services.scheduler import exceptional_swing_digest_job
+    exceptional_swing_digest_job()
+    return {"status": "exceptional/V3 digest completed"}
 
 
 @router.post("/run-holdings")

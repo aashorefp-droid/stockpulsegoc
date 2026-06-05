@@ -98,17 +98,33 @@ _SCANNER_SNAPSHOT_ENABLED = _env_enabled(
 )
 _SWEEP_DIGEST_ENABLED = _env_enabled("SWEEP_DIGEST_ENABLED", "1")
 _SPY_V4_SUMMARY_ENABLED = _env_enabled("SPY_V4_SUMMARY_ENABLED", "1")
-_EXCEPTIONAL_SWING_DIGEST_ENABLED = _env_enabled("EXCEPTIONAL_SWING_DIGEST_ENABLED", "1")
+_EXCEPTIONAL_SWING_DIGEST_ENABLED = _env_enabled(
+    "EXCEPTIONAL_SWING_DIGEST_ENABLED",
+    os.getenv("BREAKOUT_DIGEST_ENABLED", "1"),
+)
 _EXCEPTIONAL_SWING_DIGEST_WATCHLISTS = [
     w.strip().lower()
-    for w in os.getenv("EXCEPTIONAL_SWING_DIGEST_WATCHLISTS", "default,momentum").split(",")
+    for w in os.getenv(
+        "EXCEPTIONAL_SWING_DIGEST_WATCHLISTS",
+        os.getenv("BREAKOUT_DIGEST_WATCHLISTS", "default,momentum"),
+    ).split(",")
     if w.strip()
 ]
+_EXCEPTIONAL_SWING_SCAN_MODE = os.getenv(
+    "EXCEPTIONAL_SWING_SCAN_MODE",
+    os.getenv("BREAKOUT_DIGEST_SCAN_MODE", "swing_v3"),
+).strip() or "swing_v3"
 try:
-    _EXCEPTIONAL_SWING_MAX_WORKERS = max(1, int(os.getenv("EXCEPTIONAL_SWING_MAX_WORKERS", "8")))
+    _EXCEPTIONAL_SWING_MAX_WORKERS = max(
+        1,
+        int(os.getenv("EXCEPTIONAL_SWING_MAX_WORKERS", os.getenv("BREAKOUT_DIGEST_MAX_WORKERS", "8"))),
+    )
 except ValueError:
     _EXCEPTIONAL_SWING_MAX_WORKERS = 8
-_EXCEPTIONAL_SWING_SEND_EMPTY = _env_enabled("EXCEPTIONAL_SWING_SEND_EMPTY", "1")
+_EXCEPTIONAL_SWING_SEND_EMPTY = _env_enabled(
+    "EXCEPTIONAL_SWING_SEND_EMPTY",
+    os.getenv("BREAKOUT_DIGEST_SEND_EMPTY", "1"),
+)
 _HOLDINGS_SUMMARY_ENABLED = _env_enabled("HOLDINGS_SUMMARY_ENABLED", "1")
 _HOLDINGS_EMAIL_ENABLED = _env_enabled("HOLDINGS_EMAIL_ENABLED", "1")
 _HOLDINGS_TELEGRAM_ENABLED = _env_enabled("HOLDINGS_TELEGRAM_ENABLED", "1")
@@ -868,7 +884,7 @@ def sweep_digest_job():
 
 
 def exceptional_swing_digest_job():
-    """Post-market: scan NYSE/NASDAQ swing universes and send Exceptional setups only."""
+    """Post-market: scan configured lists and send Exceptional/V3 setups."""
     if not _EXCEPTIONAL_SWING_DIGEST_ENABLED:
         logger.info("[scheduler] exceptional swing digest skipped: EXCEPTIONAL_SWING_DIGEST_ENABLED=0")
         return
@@ -880,14 +896,17 @@ def exceptional_swing_digest_job():
         from backend.services.scanner import (
             WATCHLISTS,
             SWING_UNIVERSE_PRESETS,
+            get_earnings_watchlist,
             get_swing_universe_tickers,
             scan_single,
         )
+        from backend.db.holdings_store import get_holdings_tickers
         from backend.services.scanner_snapshot import save_snapshot
 
+        supported_lists = set(SWING_UNIVERSE_PRESETS) | set(WATCHLISTS) | {"holdings", "earnings"}
         watchlists = [
             w for w in _EXCEPTIONAL_SWING_DIGEST_WATCHLISTS
-            if w in SWING_UNIVERSE_PRESETS or w in WATCHLISTS
+            if w in supported_lists
         ] or ["default", "momentum"]
 
         def is_exceptional(row: dict) -> bool:
@@ -896,13 +915,25 @@ def exceptional_swing_digest_job():
                 and row.get("w30ma_curl")
             )
 
+        def is_v3_setup(row: dict) -> bool:
+            return (
+                not row.get("error")
+                and row.get("dt3_setup") in ("sweep_reclaim", "break_retest")
+                and row.get("dt3_side") in ("long", "short")
+            )
+
         all_hits: list[dict] = []
+        v3_hits: list[dict] = []
         scanned_total = 0
         snapshot_counts: dict[str, int] = {}
 
         for watchlist in watchlists:
             if watchlist in SWING_UNIVERSE_PRESETS:
                 tickers = get_swing_universe_tickers(watchlist)
+            elif watchlist == "holdings":
+                tickers = get_holdings_tickers()
+            elif watchlist == "earnings":
+                tickers = get_earnings_watchlist()
             else:
                 tickers = list(WATCHLISTS.get(watchlist, []))
             if not tickers:
@@ -914,7 +945,7 @@ def exceptional_swing_digest_job():
             results: list[dict | None] = [None] * len(tickers)
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
-                    pool.submit(scan_single, ticker, None, None, "swing"): idx
+                    pool.submit(scan_single, ticker, None, None, _EXCEPTIONAL_SWING_SCAN_MODE): idx
                     for idx, ticker in enumerate(tickers)
                 }
                 for fut in as_completed(futures):
@@ -936,6 +967,7 @@ def exceptional_swing_digest_job():
             snapshot_counts[watchlist] = len(clean_results)
             save_snapshot(watchlist, clean_results)
             all_hits.extend(r for r in clean_results if is_exceptional(r))
+            v3_hits.extend(r for r in clean_results if is_v3_setup(r))
 
         def _money(value) -> str:
             return f"${float(value):.2f}" if isinstance(value, (int, float)) else "-"
@@ -986,17 +1018,50 @@ def exceptional_swing_digest_job():
                 str(row.get("ticker") or ""),
             )
 
+        def _dedupe_rows(rows: list[dict], key_fn) -> list[dict]:
+            seen: set[tuple] = set()
+            out: list[dict] = []
+            for row in rows:
+                key = key_fn(row)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(row)
+            return out
+
+        all_hits = _dedupe_rows(
+            all_hits,
+            lambda r: (str(r.get("ticker") or "").upper(), "exceptional"),
+        )
+        v3_hits = _dedupe_rows(
+            v3_hits,
+            lambda r: (
+                str(r.get("ticker") or "").upper(),
+                str(r.get("dt3_setup") or ""),
+                str(r.get("dt3_side") or ""),
+            ),
+        )
         all_hits.sort(key=_sort_key)
+        v3_hits.sort(
+            key=lambda r: (
+                _confidence_rank(r),
+                -_num(r.get("dt3_rr")),
+                -_num(r.get("score")),
+                str(r.get("ticker") or ""),
+            )
+        )
 
         today = datetime.now(CST).date().isoformat()
         counts = ", ".join(f"{k}={v}" for k, v in snapshot_counts.items())
-        if not all_hits:
+        if not all_hits and not v3_hits:
             if not _EXCEPTIONAL_SWING_SEND_EMPTY:
                 logger.info("[scheduler] exceptional swing digest: 0 hits; scanned %s (%s)", scanned_total, counts)
                 return
             msg = (
-                f"<b>Exceptional Swing Setups - {today}</b>\n"
-                f"NYSE/NASDAQ daily swing scan: 0 Exceptional / {scanned_total} scanned\n"
+                f"<b>Exceptional / V3 Setups - {today}</b>\n"
+                f"0 hits / {scanned_total} scanned\n"
+                f"Watchlists: {html.escape(', '.join(watchlists))}\n"
+                f"Scan mode: {html.escape(_EXCEPTIONAL_SWING_SCAN_MODE)}\n"
                 f"Snapshots saved: {html.escape(counts or '-')}"
             )
             target_chat = TELEGRAM_GROUP_CHAT_ID or TELEGRAM_CHAT_ID
@@ -1007,7 +1072,7 @@ def exceptional_swing_digest_job():
                 msg,
                 message_thread_id=send_thread,
             )
-            logger.info("[scheduler] exceptional swing digest sent empty=%s scanned=%s", sent, scanned_total)
+            logger.info("[scheduler] exceptional/v3 digest sent empty=%s scanned=%s", sent, scanned_total)
             return
 
         def _line(row: dict) -> str:
@@ -1034,16 +1099,45 @@ def exceptional_swing_digest_job():
                 parts.append(html.escape(reason))
             return "\n   ".join(parts)
 
+        def _v3_line(row: dict) -> str:
+            ticker = html.escape(str(row.get("ticker") or "").upper())
+            source = html.escape(str(row.get("snapshot_watchlist") or "").replace("_", " ").upper())
+            setup = html.escape(str(row.get("dt3_setup") or "").replace("_", "+"))
+            side = html.escape(str(row.get("dt3_side") or "-"))
+            grade = html.escape(str(row.get("dt3_grade") or "-"))
+            level = html.escape(str(row.get("dt3_level") or "-"))
+            rationale = html.escape(str(row.get("dt3_rationale") or "")[:180])
+            parts = [
+                f"<b>{ticker}</b> {source}",
+                f"{setup} | {side} | Grade {grade} | Level {level} {_money(row.get('dt3_level_val'))}",
+                f"Entry {_money(row.get('dt3_entry'))} / Stop {_money(row.get('dt3_stop'))} / T1 {_money(row.get('dt3_t1'))}",
+                f"R/R {_rr(row.get('dt3_rr'))} | CONF {html.escape(str(row.get('confidence') or '-'))} | Score {html.escape(str(row.get('score') if row.get('score') is not None else '-'))}",
+            ]
+            if rationale:
+                parts.append(rationale)
+            return "\n   ".join(parts)
+
         max_rows = 12
         header = (
-            f"<b>30wk MA Curl Setups - {today}</b>\n"
-            f"{len(all_hits)} hits / {scanned_total} scanned\n"
+            f"<b>Exceptional / V3 Setups - {today}</b>\n"
+            f"{len(all_hits)} exceptional | {len(v3_hits)} V3 / {scanned_total} scanned\n"
+            f"Watchlists: {html.escape(', '.join(watchlists))}\n"
+            f"Scan mode: {html.escape(_EXCEPTIONAL_SWING_SCAN_MODE)}\n"
             f"Sort: CONF HIGH, score, R/R, wkATR%, risk%\n"
             f"Snapshots saved: {html.escape(counts or '-')}\n"
         )
-        body = "\n\n".join(_line(row) for row in all_hits[:max_rows])
-        if len(all_hits) > max_rows:
-            body += f"\n\n+{len(all_hits) - max_rows} more Exceptional setups saved in snapshots."
+        sections: list[str] = []
+        if all_hits:
+            body = "\n\n".join(_line(row) for row in all_hits[:max_rows])
+            if len(all_hits) > max_rows:
+                body += f"\n\n+{len(all_hits) - max_rows} more Exceptional setups saved in snapshots."
+            sections.append(f"<b>30wk MA Curl / Exceptional</b>\n{body}")
+        if v3_hits:
+            body = "\n\n".join(_v3_line(row) for row in v3_hits[:max_rows])
+            if len(v3_hits) > max_rows:
+                body += f"\n\n+{len(v3_hits) - max_rows} more V3 setups saved in snapshots."
+            sections.append(f"<b>V3 Identified</b>\n{body}")
+        body = "\n\n".join(sections)
         msg = f"{header}\n{body}"
         target_chat = TELEGRAM_GROUP_CHAT_ID or TELEGRAM_CHAT_ID
         send_thread = TELEGRAM_SWING_MESSAGE_THREAD_ID or TELEGRAM_MESSAGE_THREAD_ID
@@ -1054,14 +1148,20 @@ def exceptional_swing_digest_job():
             message_thread_id=send_thread,
         )
         logger.info(
-            "[scheduler] exceptional swing digest sent=%s hits=%s scanned=%s (%s)",
+            "[scheduler] exceptional/v3 digest sent=%s exceptional=%s v3=%s scanned=%s (%s)",
             sent,
             len(all_hits),
+            len(v3_hits),
             scanned_total,
             counts,
         )
     except Exception as e:
         logger.error(f"[scheduler] exceptional swing digest failed: {e}")
+
+
+def breakout_digest_job():
+    """Backward-compatible alias for the exceptional/V3 scanner digest."""
+    return exceptional_swing_digest_job()
 
 
 def holdings_summary_job():

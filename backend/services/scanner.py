@@ -2088,6 +2088,8 @@ def _scanner_mode(mode: Optional[str]) -> str:
         return "overview"
     if raw == "swing":
         return "swing"
+    if raw in {"swing_v3", "swing_daytrading", "swing_day_trading"}:
+        return "swing_v3"
     if raw in {"longterm", "long_term", "lt"}:
         return "longterm"
     if raw in {"fib", "fib_targets", "fibonacci"}:
@@ -2106,7 +2108,7 @@ def scan_single(ticker: str, as_of: Optional[str] = None,
         ticker = (ticker or "").strip().upper()
         scan_mode = _scanner_mode(mode)
         include_fundamentals = scan_mode in {"overview", "longterm"}
-        include_day_trading = scan_mode in {"overview", "daytrading"}
+        include_day_trading = scan_mode in {"overview", "daytrading", "swing_v3"}
         include_options = scan_mode in {"overview", "options"}
         is_etf = _is_etf_symbol(ticker)
         if as_of:
