@@ -21,7 +21,7 @@ const WATCHLISTS = [
   { key: "custom",        label: "Custom",            count: 0   },
 ];
 
-type Filter = "all" | "actionable" | "rank1" | "exceptional" | "high_short" | "day_spring" | "lt_spring" | "w30ma_curl" | "sweep_reclaim_long" | "sweep_reclaim_short" | "breakout" | "prebreakout" | "quality_long" | "btd" | "btd_trigger" | "speculative" | "news_good" | "news_bad";
+type Filter = "all" | "actionable" | "rank1" | "exceptional" | "flip_zero" | "high_short" | "day_spring" | "lt_spring" | "w30ma_curl" | "sweep_reclaim_long" | "sweep_reclaim_short" | "breakout" | "prebreakout" | "quality_long" | "btd" | "btd_trigger" | "speculative" | "news_good" | "news_bad";
 
 const isBtdLive = (s?: string) => s === "TRIGGER" || s === "ARMED" || s === "ARMED-DEEP";
 type SortBy = "score" | "grade" | "rr" | "swingReward" | "fibReward" | "dayReward" | "ltEntryPct" | "valuation" | "longRunway" | "cyclicalPeak" | "multiBagger" | "newsGood" | "newsBad";
@@ -1034,7 +1034,7 @@ export default function ScannerPage() {
         // Rank 1 (all subsume mtf_rank===1) → drives Telegram notify list.
         let tier: string | undefined;
         if (r.mtf_rank === 1) {
-          if (["S", "A"].includes(r.entry_grade ?? "") && r.vol_trend === "ACCUMULATING") tier = "Exceptional";
+          if (r.w30ma_curl) tier = "Exceptional";
           else if (r.lre_status === "ACTIVE" || r.lre_status === "DISCOUNT") tier = "Actionable";
           else tier = "Rank 1";
         }
@@ -1637,6 +1637,7 @@ export default function ScannerPage() {
   const passesFilter = (r: ScanResult, f: Filter): boolean => {
     switch (f) {
       case "rank1":               return r.mtf_rank === 1;
+      case "flip_zero":           return r.verdict_flip_days === 0;
       case "high_short":          return (r.short_pct ?? 0) >= 10;
       case "btd":                 return isBtdLive(r.btd_state);
       case "btd_trigger":         return r.btd_state === "TRIGGER";
@@ -1652,9 +1653,7 @@ export default function ScannerPage() {
           && (r.verdict === "BULLISH" || r.verdict === "LEAN BULLISH")
           && r.confidence === "STRONG";
       case "exceptional":
-        return ["S", "A"].includes(r.entry_grade ?? "")
-          && r.mtf_rank === 1
-          && r.vol_trend === "ACCUMULATING";
+        return !!r.w30ma_curl;
       case "actionable":
         return r.mtf_rank === 1
           && (r.lre_status === "ACTIVE" || r.lre_status === "DISCOUNT");
@@ -2501,7 +2500,7 @@ export default function ScannerPage() {
         const cats: { label: string; test: (r: ScanResult) => boolean }[] = [
           { label: "🎯 Actionable", test: r => r.mtf_rank === 1 && (r.lre_status === "ACTIVE" || r.lre_status === "DISCOUNT") },
           { label: "Rank 1",        test: r => r.mtf_rank === 1 },
-          { label: "Exceptional",   test: r => ["S", "A"].includes(r.entry_grade ?? "") && r.mtf_rank === 1 && r.vol_trend === "ACCUMULATING" },
+          { label: "Exceptional",   test: r => !!r.w30ma_curl },
           { label: "🌱 Day Spring", test: r => !!r.day_spring },
           { label: "🌱 LT Spring",  test: r => !!r.long_term_spring },
           { label: "⭐ Bullish",    test: r => r.lre_score === 3 && (r.verdict === "BULLISH" || r.verdict === "LEAN BULLISH") && r.confidence === "STRONG" },
@@ -2580,7 +2579,7 @@ export default function ScannerPage() {
         const cats: { label: string; test: (r: ScanResult) => boolean }[] = [
           { label: "🎯 Actionable", test: r => r.mtf_rank === 1 && (r.lre_status === "ACTIVE" || r.lre_status === "DISCOUNT") },
           { label: "Rank 1",        test: r => r.mtf_rank === 1 },
-          { label: "Exceptional",   test: r => ["S", "A"].includes(r.entry_grade ?? "") && r.mtf_rank === 1 && r.vol_trend === "ACCUMULATING" },
+          { label: "Exceptional",   test: r => !!r.w30ma_curl },
           { label: "🌱 Day Spring", test: r => !!r.day_spring },
           { label: "🌱 LT Spring",  test: r => !!r.long_term_spring },
           { label: "⭐ Bullish",    test: r => r.lre_score === 3 && (r.verdict === "BULLISH" || r.verdict === "LEAN BULLISH") && r.confidence === "STRONG" },
@@ -2649,7 +2648,7 @@ export default function ScannerPage() {
             className="flex flex-wrap gap-1 bg-card border border-border rounded-lg p-1"
             title="Click a chip to toggle it. Stack multiple chips for an OR-match. Click All (or right-click any chip) to reset."
           >
-            {(["all", "actionable", "rank1", "exceptional", "high_short", "btd", "btd_trigger", "day_spring", "lt_spring", "w30ma_curl", "sweep_reclaim_long", "sweep_reclaim_short", "breakout", "prebreakout", "quality_long", "speculative", "news_good", "news_bad"] as Filter[]).map(f => {
+            {(["all", "actionable", "rank1", "exceptional", "flip_zero", "high_short", "btd", "btd_trigger", "day_spring", "lt_spring", "w30ma_curl", "sweep_reclaim_long", "sweep_reclaim_short", "breakout", "prebreakout", "quality_long", "speculative", "news_good", "news_bad"] as Filter[]).map(f => {
               const active = f === "all" ? filters.size === 0 : filters.has(f);
               return (
               <button key={f}
@@ -2665,6 +2664,7 @@ export default function ScannerPage() {
                 : f === "all"         ? `All (${results.filter(r => !r.error).length})`
                 : f === "actionable" ? `🎯 Actionable (${results.filter(r => r.mtf_rank === 1 && (r.lre_status === "ACTIVE" || r.lre_status === "DISCOUNT")).length})`
                 : f === "rank1"      ? `Rank 1 (${results.filter(r => r.mtf_rank === 1).length})`
+                : f === "flip_zero"  ? `Flip 0d (${results.filter(r => r.verdict_flip_days === 0).length})`
                 : f === "high_short" ? `🔥 High Short (${results.filter(r => (r.short_pct ?? 0) >= 10).length})`
                 : f === "btd"        ? `📉 BTD (${results.filter(r => isBtdLive(r.btd_state)).length})`
                 : f === "btd_trigger" ? `✅ BTD Trigger · FULL (${results.filter(r => r.btd_state === "TRIGGER").length})`
@@ -2675,7 +2675,7 @@ export default function ScannerPage() {
                 : f === "speculative" ? `🚀 Spec/Growth (${results.filter(r => r.multi_bagger || r.long_runway).length})`
                 : f === "news_good"  ? `📰 Good News (${results.filter(r => r.news === "Good").length})`
                 : f === "news_bad"   ? `📰 Bad News (${results.filter(r => r.news === "Bad").length})`
-                : `Exceptional (${results.filter(r => ["S","A"].includes(r.entry_grade ?? "") && r.mtf_rank === 1 && r.vol_trend === "ACCUMULATING").length})`}
+                : `Exceptional (${results.filter(r => !!r.w30ma_curl).length})`}
               </button>
               );
             })}

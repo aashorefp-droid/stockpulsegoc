@@ -101,7 +101,7 @@ _SPY_V4_SUMMARY_ENABLED = _env_enabled("SPY_V4_SUMMARY_ENABLED", "1")
 _EXCEPTIONAL_SWING_DIGEST_ENABLED = _env_enabled("EXCEPTIONAL_SWING_DIGEST_ENABLED", "1")
 _EXCEPTIONAL_SWING_DIGEST_WATCHLISTS = [
     w.strip().lower()
-    for w in os.getenv("EXCEPTIONAL_SWING_DIGEST_WATCHLISTS", "nyse_swing,nasdaq_swing").split(",")
+    for w in os.getenv("EXCEPTIONAL_SWING_DIGEST_WATCHLISTS", "default,momentum").split(",")
     if w.strip()
 ]
 try:
@@ -878,6 +878,7 @@ def exceptional_swing_digest_job():
 
     try:
         from backend.services.scanner import (
+            WATCHLISTS,
             SWING_UNIVERSE_PRESETS,
             get_swing_universe_tickers,
             scan_single,
@@ -886,15 +887,13 @@ def exceptional_swing_digest_job():
 
         watchlists = [
             w for w in _EXCEPTIONAL_SWING_DIGEST_WATCHLISTS
-            if w in SWING_UNIVERSE_PRESETS
-        ] or ["nyse_swing", "nasdaq_swing"]
+            if w in SWING_UNIVERSE_PRESETS or w in WATCHLISTS
+        ] or ["default", "momentum"]
 
         def is_exceptional(row: dict) -> bool:
             return (
                 not row.get("error")
-                and row.get("mtf_rank") == 1
-                and row.get("entry_grade") in ("S", "A")
-                and row.get("vol_trend") == "ACCUMULATING"
+                and row.get("w30ma_curl")
             )
 
         all_hits: list[dict] = []
@@ -902,7 +901,10 @@ def exceptional_swing_digest_job():
         snapshot_counts: dict[str, int] = {}
 
         for watchlist in watchlists:
-            tickers = get_swing_universe_tickers(watchlist)
+            if watchlist in SWING_UNIVERSE_PRESETS:
+                tickers = get_swing_universe_tickers(watchlist)
+            else:
+                tickers = list(WATCHLISTS.get(watchlist, []))
             if not tickers:
                 logger.warning("[scheduler] exceptional swing: %s produced no tickers", watchlist)
                 snapshot_counts[watchlist] = 0
@@ -954,14 +956,37 @@ def exceptional_swing_digest_job():
         def _rr(value) -> str:
             return f"{float(value):.2f}x" if isinstance(value, (int, float)) else "-"
 
-        grade_rank = {"S": 0, "A": 1}
-        all_hits.sort(
-            key=lambda r: (
-                grade_rank.get(str(r.get("entry_grade") or ""), 9),
-                -abs(float(r.get("score") or 0)),
-                str(r.get("ticker") or ""),
+        def _num(value, default: float = 0.0) -> float:
+            try:
+                if isinstance(value, (int, float)):
+                    return float(value)
+                if value not in (None, ""):
+                    return float(str(value))
+            except Exception:
+                pass
+            return default
+
+        def _confidence_rank(row: dict) -> int:
+            conf = str(row.get("confidence") or "").strip().upper()
+            if conf == "HIGH":
+                return 0
+            if conf in ("MED", "MEDIUM"):
+                return 1
+            if conf == "LOW":
+                return 2
+            return 3
+
+        def _sort_key(row: dict):
+            return (
+                _confidence_rank(row),
+                -_num(row.get("score")),
+                -_num(row.get("rr_t1")),
+                -_num(row.get("wk_atr_pct")),
+                _num(row.get("risk_pct"), 999.0),
+                str(row.get("ticker") or ""),
             )
-        )
+
+        all_hits.sort(key=_sort_key)
 
         today = datetime.now(CST).date().isoformat()
         counts = ", ".join(f"{k}={v}" for k, v in snapshot_counts.items())
@@ -990,13 +1015,20 @@ def exceptional_swing_digest_job():
             source = html.escape(str(row.get("snapshot_watchlist") or "").replace("_", " ").upper())
             verdict = html.escape(str(row.get("verdict") or "-"))
             grade = html.escape(str(row.get("entry_grade") or "-"))
+            label = html.escape(str(row.get("entry_label") or "-"))
+            confidence = html.escape(str(row.get("confidence") or "-"))
+            score = html.escape(str(row.get("score") if row.get("score") is not None else "-"))
             btd = html.escape(str(row.get("btd_state") or "-"))
             parts = [
                 f"<b>{ticker}</b> {source}",
-                f"{_money(row.get('price'))} | {verdict} | Grade {grade}",
-                f"Entry {_money(row.get('entry'))} / Stop {_money(row.get('stop_loss'))} / T1 {_money(row.get('target1'))}",
+                f"{_money(row.get('price'))} | CONF {confidence} | Score {score} | {verdict}",
+                f"Grade {grade} ({label}) | Exp WR {_pct(row.get('expected_wr'))}",
+                f"Watch {_money(row.get('entry'))} / Stop {_money(row.get('stop_loss'))} / T1 {_money(row.get('target1'))}",
                 f"R/R {_rr(row.get('rr_t1'))} | Reward {_reward_pct(row)} | BTD {btd}",
+                f"Vol wkATR {_pct(row.get('wk_atr_pct'))} | Risk {_pct(row.get('risk_pct'))}",
             ]
+            if row.get("w30ma_curl"):
+                parts.append(html.escape(str(row.get("w30ma_reason") or "30wk MA curling up")[:180]))
             reason = str(row.get("lre_reason") or row.get("mtf_action") or "")[:180]
             if reason:
                 parts.append(html.escape(reason))
@@ -1004,8 +1036,9 @@ def exceptional_swing_digest_job():
 
         max_rows = 12
         header = (
-            f"<b>Exceptional Swing Setups - {today}</b>\n"
-            f"{len(all_hits)} Exceptional / {scanned_total} scanned\n"
+            f"<b>30wk MA Curl Setups - {today}</b>\n"
+            f"{len(all_hits)} hits / {scanned_total} scanned\n"
+            f"Sort: CONF HIGH, score, R/R, wkATR%, risk%\n"
             f"Snapshots saved: {html.escape(counts or '-')}\n"
         )
         body = "\n\n".join(_line(row) for row in all_hits[:max_rows])

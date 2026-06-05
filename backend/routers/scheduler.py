@@ -88,6 +88,14 @@ def trigger_sweep_digest():
     return {"status": "sweep digest completed"}
 
 
+@router.post("/run-breakouts")
+def trigger_breakout_digest():
+    """Manually trigger the post-market breakout scanner digest."""
+    from backend.services.scheduler import breakout_digest_job
+    breakout_digest_job()
+    return {"status": "breakout digest completed"}
+
+
 @router.post("/run-holdings")
 def trigger_holdings_summary():
     """Manually trigger the post-market holdings swing summary."""

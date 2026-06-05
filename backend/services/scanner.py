@@ -29,8 +29,7 @@ def _v3_qualifying_tier(row: dict) -> Optional[str]:
     Telegram alert only fires for setups that show up in those tabs."""
     if row.get("mtf_rank") != 1:
         return None
-    if (row.get("entry_grade") in ("S", "A")
-            and row.get("vol_trend") == "ACCUMULATING"):
+    if row.get("w30ma_curl"):
         return "Exceptional"
     if row.get("lre_status") in ("ACTIVE", "DISCOUNT"):
         return "Actionable"

@@ -23,7 +23,7 @@ def _load_env_file(path: str) -> int:
                     continue
                 k, _, v = line.partition("=")
                 k = k.strip()
-                v = v.strip().strip('"').strip("'")
+                v = v.strip().rstrip(",").strip().strip('"').strip("'")
                 # Skip empty values — a placeholder line like `KEY=` would
                 # otherwise pollute os.environ and shadow a real value coming
                 # from a different layer (e.g. streamlit/config.py's
@@ -116,6 +116,7 @@ TELEGRAM_SPY_INTRADAY_MESSAGE_THREAD_ID = _opt("TELEGRAM_SPY_INTRADAY_MESSAGE_TH
 TELEGRAM_EARNINGS_MESSAGE_THREAD_ID = _opt("TELEGRAM_EARNINGS_MESSAGE_THREAD_ID", "")
 TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID = _opt("TELEGRAM_MOMENTUM_MESSAGE_THREAD_ID", "")
 TELEGRAM_MACRO_MESSAGE_THREAD_ID = _opt("TELEGRAM_MACRO_MESSAGE_THREAD_ID", "")
+TELEGRAM_BREAKOUT_MESSAGE_THREAD_ID = _opt("TELEGRAM_BREAKOUT_MESSAGE_THREAD_ID", "50")
 
 if _missing:
     logger.warning(
