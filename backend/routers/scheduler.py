@@ -104,6 +104,14 @@ def trigger_exceptional_swing_digest():
     return {"status": "exceptional/V3 digest completed"}
 
 
+@router.post("/run-v3-refresh")
+def trigger_backend_v3_refresh():
+    """Manually trigger the backend V3 refresh, outside the market-window gate."""
+    from backend.services.scheduler import backend_v3_refresh_job
+    backend_v3_refresh_job(force=True)
+    return {"status": "backend V3 refresh completed"}
+
+
 @router.post("/run-holdings")
 def trigger_holdings_summary():
     """Manually trigger the post-market holdings swing summary."""

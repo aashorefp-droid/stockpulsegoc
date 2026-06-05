@@ -128,6 +128,17 @@ _EXCEPTIONAL_SWING_SEND_EMPTY = _env_enabled(
 _HOLDINGS_SUMMARY_ENABLED = _env_enabled("HOLDINGS_SUMMARY_ENABLED", "1")
 _HOLDINGS_EMAIL_ENABLED = _env_enabled("HOLDINGS_EMAIL_ENABLED", "1")
 _HOLDINGS_TELEGRAM_ENABLED = _env_enabled("HOLDINGS_TELEGRAM_ENABLED", "1")
+_BACKEND_V3_REFRESH_ENABLED = _env_enabled("BACKEND_V3_REFRESH_ENABLED", "0")
+_BACKEND_V3_REFRESH_WATCHLISTS = [
+    w.strip().lower()
+    for w in os.getenv("BACKEND_V3_REFRESH_WATCHLISTS", "holdings,earnings").split(",")
+    if w.strip()
+]
+try:
+    _BACKEND_V3_REFRESH_MAX_WORKERS = max(1, int(os.getenv("BACKEND_V3_REFRESH_MAX_WORKERS", "6")))
+except ValueError:
+    _BACKEND_V3_REFRESH_MAX_WORKERS = 6
+_BACKEND_V3_MESSAGE_THREAD_ID = os.getenv("BACKEND_V3_MESSAGE_THREAD_ID", "").strip()
 _NEWS_DIGEST_CATCHUP_ENABLED = _env_enabled("NEWS_DIGEST_CATCHUP_ENABLED", "1")
 try:
     _NEWS_DIGEST_MAX_WORKERS = max(1, int(os.getenv("NEWS_DIGEST_MAX_WORKERS", "16")))
@@ -1929,6 +1940,160 @@ def macro_regime_watch_job():
     _save_macro_state(state)
 
 
+def _backend_v3_in_trade_window(now_et: datetime | None = None) -> bool:
+    now_et = now_et or datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() >= 5:
+        return False
+    minutes = now_et.hour * 60 + now_et.minute
+    morning_start = 9 * 60 + 50
+    morning_end = 11 * 60
+    afternoon_start = 13 * 60 + 30
+    afternoon_end = 15 * 60 + 30
+    return (
+        morning_start <= minutes <= morning_end
+        or afternoon_start <= minutes <= afternoon_end
+    )
+
+
+def _backend_v3_tickers() -> dict[str, list[str]]:
+    from backend.db.holdings_store import get_holdings_tickers
+    from backend.services.scanner import (
+        WATCHLISTS,
+        SWING_UNIVERSE_PRESETS,
+        get_earnings_watchlist,
+        get_swing_universe_tickers,
+    )
+
+    by_ticker: dict[str, list[str]] = {}
+
+    def add(source: str, tickers: list[str]) -> None:
+        label = source.strip().lower()
+        for raw in tickers:
+            ticker = str(raw or "").strip().upper()
+            if not ticker:
+                continue
+            by_ticker.setdefault(ticker, [])
+            if label not in by_ticker[ticker]:
+                by_ticker[ticker].append(label)
+
+    for watchlist in _BACKEND_V3_REFRESH_WATCHLISTS:
+        try:
+            if watchlist == "holdings":
+                add(watchlist, get_holdings_tickers())
+            elif watchlist == "earnings":
+                add(watchlist, get_earnings_watchlist())
+            elif watchlist in SWING_UNIVERSE_PRESETS:
+                add(watchlist, get_swing_universe_tickers(watchlist))
+            else:
+                add(watchlist, list(WATCHLISTS.get(watchlist, [])))
+        except Exception as exc:
+            logger.warning("[scheduler] backend v3 %s watchlist failed: %s", watchlist, str(exc)[:120])
+    return by_ticker
+
+
+def backend_v3_refresh_job(force: bool = False):
+    """Server-side V3 scan so Telegram alerts do not depend on the UI being open."""
+    if not _BACKEND_V3_REFRESH_ENABLED and not force:
+        logger.info("[scheduler] backend v3 refresh skipped: BACKEND_V3_REFRESH_ENABLED=0")
+        return
+    if not force and not _backend_v3_in_trade_window():
+        logger.debug("[scheduler] backend v3 refresh skipped: outside V3 trade window")
+        return
+
+    import html
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        from day_trading.v3 import analyze as _v3_analyze
+
+        by_ticker = _backend_v3_tickers()
+        tickers = list(by_ticker)
+        if not tickers:
+            logger.info("[scheduler] backend v3 refresh skipped: no tickers from %s", _BACKEND_V3_REFRESH_WATCHLISTS)
+            return
+
+        def _one(ticker: str) -> tuple[str, dict]:
+            try:
+                result = _v3_analyze(ticker)
+                sig = result.get("signal") or {}
+                lvl = result.get("levels") or {}
+                targets = sig.get("targets") or []
+                setup = sig.get("setup") or ("no_setup" if lvl else "error")
+                return ticker, {
+                    "dt3_setup": setup,
+                    "dt3_side": sig.get("side"),
+                    "dt3_grade": sig.get("grade"),
+                    "dt3_level": sig.get("level"),
+                    "dt3_level_val": sig.get("level_val"),
+                    "dt3_entry": sig.get("entry"),
+                    "dt3_stop": sig.get("stop"),
+                    "dt3_t1": targets[0] if len(targets) >= 1 else None,
+                    "dt3_t2": targets[1] if len(targets) >= 2 else None,
+                    "dt3_rr": sig.get("rr"),
+                    "dt3_rationale": sig.get("rationale") or result.get("error"),
+                    "dt3_as_of": result.get("as_of"),
+                }
+            except Exception as exc:
+                return ticker, {
+                    "dt3_setup": "error",
+                    "dt3_rationale": f"{type(exc).__name__}: {str(exc)[:120]}",
+                }
+
+        def _money(value) -> str:
+            return f"${float(value):.2f}" if isinstance(value, (int, float)) else "-"
+
+        def _rr(value) -> str:
+            return f"{float(value):.2f}x" if isinstance(value, (int, float)) else "-"
+
+        scanned = 0
+        sent = 0
+        workers = max(1, min(len(tickers), _BACKEND_V3_REFRESH_MAX_WORKERS))
+        chat_id, thread_id = _telegram_target(_BACKEND_V3_MESSAGE_THREAD_ID or TELEGRAM_SWING_MESSAGE_THREAD_ID)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_one, ticker): ticker for ticker in tickers}
+            for fut in as_completed(futures):
+                ticker, row = fut.result()
+                scanned += 1
+                setup = str(row.get("dt3_setup") or "")
+                side = str(row.get("dt3_side") or "")
+                if setup not in {"sweep_reclaim", "break_retest"} or side not in {"long", "short"}:
+                    continue
+
+                state_key = f"backend_v3:{ticker}:{setup}:{side}"
+                if _daily_job_sent(state_key):
+                    continue
+
+                sources = ", ".join(s.upper() for s in by_ticker.get(ticker, []))
+                title = f"<b>V3 Backend Alert - {html.escape(ticker)}</b>"
+                msg = (
+                    f"{title}\n"
+                    f"<i>{html.escape(sources or 'WATCHLIST')} | {html.escape(setup.replace('_', '+'))} | {html.escape(side)}</i>\n"
+                    f"Grade {html.escape(str(row.get('dt3_grade') or '-'))} | "
+                    f"Level {html.escape(str(row.get('dt3_level') or '-'))} {_money(row.get('dt3_level_val'))}\n"
+                    f"Entry {_money(row.get('dt3_entry'))} / Stop {_money(row.get('dt3_stop'))}\n"
+                    f"T1 {_money(row.get('dt3_t1'))} / T2 {_money(row.get('dt3_t2'))} / R:R {_rr(row.get('dt3_rr'))}"
+                )
+                rationale = html.escape(str(row.get("dt3_rationale") or "")[:220])
+                if rationale:
+                    msg += f"\n\n<i>{rationale}</i>"
+                if row.get("dt3_as_of"):
+                    msg += f"\nAs of: {html.escape(str(row.get('dt3_as_of')))}"
+
+                if send_telegram(TELEGRAM_BOT_TOKEN, chat_id, msg, message_thread_id=thread_id):
+                    _mark_daily_job_sent(state_key)
+                    sent += 1
+
+        logger.info(
+            "[scheduler] backend v3 refresh completed: scanned=%s sent=%s watchlists=%s force=%s",
+            scanned,
+            sent,
+            ",".join(_BACKEND_V3_REFRESH_WATCHLISTS),
+            force,
+        )
+    except Exception as exc:
+        logger.error("[scheduler] backend v3 refresh failed: %s", exc)
+
+
 def momentum_refresh_job():
     """Sunday 18:00 CST — re-screen the momentum universe and persist the
     top 20 to momentum_watchlist.json. Telegram a diff vs last week so the
@@ -2106,6 +2271,19 @@ def setup_scheduler():
             id="macro_regime_watch",
             replace_existing=True,
             misfire_grace_time=300,
+        )
+
+    if _BACKEND_V3_REFRESH_ENABLED:
+        scheduler.add_job(
+            backend_v3_refresh_job,
+            # Broad CST ranges; backend_v3_refresh_job gates exact ET windows:
+            # 09:50-11:00 ET and 13:30-15:30 ET.
+            CronTrigger(day_of_week="mon-fri",
+                        hour="8-10,12-14", minute="*/5", timezone=CST),
+            id="backend_v3_refresh",
+            replace_existing=True,
+            misfire_grace_time=300,
+            max_instances=1,
         )
 
     if _EARNINGS_JOBS_ENABLED:
