@@ -696,7 +696,7 @@ def momentum_snapshot_job():
 
 
 def spy_v4_summary_job():
-    """8:00 AM CST: send SPY Day Trading V4 plan to Telegram."""
+    """Send the SPY Day Trading V4 plan to Telegram."""
     if not _SPY_V4_SUMMARY_ENABLED:
         logger.info("[scheduler] SPY V4 summary skipped: SPY_V4_SUMMARY_ENABLED=0")
         return
@@ -883,7 +883,13 @@ def sweep_digest_job():
             f"{_block('Sweep Reclaim Long', longs)}\n\n"
             f"{_block('Sweep Reclaim Short', shorts)}"
         )
-        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+        chat_id, thread_id = _telegram_target(TELEGRAM_SWING_MESSAGE_THREAD_ID)
+        send_telegram(
+            TELEGRAM_BOT_TOKEN,
+            chat_id,
+            msg,
+            message_thread_id=thread_id,
+        )
         logger.info(
             "[scheduler] sweep digest sent: %s long / %s short from %s tickers",
             len(longs),
@@ -1461,7 +1467,13 @@ def holdings_summary_job():
                 current += "\n\n" + block
             chunks.append(current)
             for chunk in chunks:
-                telegram_ok = send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk) and telegram_ok
+                chat_id, thread_id = _telegram_target(TELEGRAM_SWING_MESSAGE_THREAD_ID)
+                telegram_ok = send_telegram(
+                    TELEGRAM_BOT_TOKEN,
+                    chat_id,
+                    chunk,
+                    message_thread_id=thread_id,
+                ) and telegram_ok
             if not telegram_ok:
                 logger.warning("[scheduler] holdings summary telegram send failed")
 
@@ -1730,8 +1742,13 @@ def stop_eps_polling():
     job = scheduler.get_job("eps_poll")
     if job:
         job.remove()
-        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-                      f"🛑 EPS polling stopped for {today_str()}")
+        chat_id, thread_id = _telegram_target(TELEGRAM_EARNINGS_MESSAGE_THREAD_ID)
+        send_telegram(
+            TELEGRAM_BOT_TOKEN,
+            chat_id,
+            f"🛑 EPS polling stopped for {today_str()}",
+            message_thread_id=thread_id,
+        )
         logger.info("[scheduler] EPS polling stopped")
 
 
@@ -2090,6 +2107,14 @@ def backend_v3_refresh_job(force: bool = False):
             ",".join(_BACKEND_V3_REFRESH_WATCHLISTS),
             force,
         )
+        if sent == 0:
+            send_telegram(
+                TELEGRAM_BOT_TOKEN,
+                chat_id,
+                f"📭 <b>V3 Backend Scan - {today_str()}</b>\n"
+                f"No qualifying setups found ({scanned} scanned).",
+                message_thread_id=thread_id,
+            )
     except Exception as exc:
         logger.error("[scheduler] backend v3 refresh failed: %s", exc)
 
@@ -2192,6 +2217,14 @@ def setup_scheduler():
         id="spy_v4_summary_morning",
         replace_existing=True,
         misfire_grace_time=600,
+    )
+
+    scheduler.add_job(
+        spy_v4_summary_job,
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=40, timezone=CST),
+        id="spy_v4_summary_post_market",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     scheduler.add_job(
